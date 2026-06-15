@@ -331,6 +331,8 @@ function selectAction(rng, situation, tactics, playerAttrs) {
     }
 
     case 'dribble': {
+      // 盘带风格是连续：0=护球 → 0.5=控球/假动作 → 1=冲刺突破
+      // 物理条件+属性决定风格，不再有离散类型
       const burst  = playerAttrs['爆发'] || 10;
       const speed  = playerAttrs['速度'] || 10;
       const control = playerAttrs['控制技巧'] || 10;
@@ -338,38 +340,19 @@ function selectAction(rng, situation, tactics, playerAttrs) {
       const space  = context.space || 10;
       const pressure = context.pressure || 0;
 
-      // burst: 爆发性冲刺
-      let burstWeight = 8 + (burst - 10) * 1.5;
-      if (space > 15) burstWeight += 12;
-      if (speed > 14) burstWeight += 5;
+      // 基础倾向：爆发高→偏冲刺，控球好→偏控制，自信高→偏冒险
+      let dribbleStyle = 0.4 + (burst - 10) * 0.03 + (speed - 10) * 0.02 - (control - 10) * 0.03 + (conf - 10) * 0.02;
+      // 空间大→冲刺，紧逼→护球/假动作
+      if (space > 20) dribbleStyle += 0.15;
+      if (pressure > 0.4) dribbleStyle -= 0.10;
+      dribbleStyle = Math.max(0, Math.min(1, dribbleStyle));
 
-      // control: 控球推进
-      let controlWeight = 10 + (control - 10) * 1.5;
-      if (pressure < 0.4) controlWeight += 5;
-
-      // force: 强行突破
-      let forceWeight = 5 + (conf - 10) * 1.0 + (speed - 10) * 0.8;
-      if (pressure > 0.5) forceWeight += 3;
-
-      // shield: 护球
-      let shieldWeight = 8;
-      if (pressure > 0.6) shieldWeight += 10;
-      if (burst < 12) shieldWeight += 3;
-
-      // feint: 假动作
-      let feintWeight = 5 + (control - 10) * 1.2 + (conf - 10) * 0.6;
-      if (pressure > 0.5 && space < 10) feintWeight += 5;
-
-      burstWeight = Math.max(1, burstWeight);
-      controlWeight = Math.max(1, controlWeight);
-      forceWeight = Math.max(1, forceWeight);
-      shieldWeight = Math.max(1, shieldWeight);
-      feintWeight = Math.max(1, feintWeight);
-
-      const options = ['burst', 'control', 'force', 'shield', 'feint'];
-      const weights = [burstWeight, controlWeight, forceWeight, shieldWeight, feintWeight];
-
-      return weightedRandom(rng, options, weights);
+      // 连续值映射到物理行为
+      if (dribbleStyle < 0.15) return 'shield';
+      if (dribbleStyle < 0.35) return 'control';
+      if (dribbleStyle < 0.55) return 'feint';
+      if (dribbleStyle < 0.75) return 'force';
+      return 'burst';
     }
 
     case 'shoot': {
@@ -377,39 +360,17 @@ function selectAction(rng, situation, tactics, playerAttrs) {
       const touch   = playerAttrs['触球精度'] || 10;
       const aerial  = playerAttrs['空中能力'] || 10;
       const conf    = playerAttrs['自信'] || 10;
-      const calm    = playerAttrs['情绪稳定性'] || 10;
       const ballH   = context.ballHeight || 0.3;
-      const dist    = context.distance || 12;
-      const pressure = context.pressure || 0;
 
-      // power: 发力抽射 — 力量+自信
-      let powerWeight = 8 + (power - 10) * 1.5 + (conf - 10) * 0.8;
-      if (dist > 18) powerWeight += 8;
-      if (dist < 8 && pressure < 0.5) powerWeight += 3;
+      // 物理强制：高空球→凌空或头球
+      if (ballH > 0.6) return (aerial > touch) ? 'header' : 'volley';
+      if (ballH > 0.4 && rng.random() < 0.3) return (aerial > touch) ? 'header' : 'volley';
 
-      // placed: 推射/兜射 — 触球精度+冷静
-      let placedWeight = 8 + (touch - 10) * 1.5 + (calm - 10) * 0.8;
-      if (pressure > 0.5) placedWeight += 4;
-      if (dist < 12) placedWeight += 3;
-
-      // volley: 凌空 — 触球精度+力量，高空球
-      let volleyWeight = 4 + (touch - 10) * 0.8 + (power - 10) * 0.6;
-      if (ballH > 0.5) volleyWeight += 12;
-      if (ballH > 0.7) volleyWeight += 8;
-
-      // header: 头球 — 空中能力
-      let headerWeight = 3 + (aerial - 10) * 2.0;
-      if (ballH > 0.6) headerWeight += 10;
-
-      powerWeight = Math.max(1, powerWeight);
-      placedWeight = Math.max(1, placedWeight);
-      volleyWeight = Math.max(1, volleyWeight);
-      headerWeight = Math.max(1, headerWeight);
-
-      const options = ['power', 'placed', 'volley', 'header'];
-      const weights = [powerWeight, placedWeight, volleyWeight, headerWeight];
-
-      return weightedRandom(rng, options, weights);
+      // 地面球：力量型 vs 技术型，连续谱
+      // 0=完全推射(placed) → 1=完全抽射(power)
+      let shootStyle = 0.4 + (power - 10) * 0.03 - (touch - 10) * 0.03 + (conf - 10) * 0.02;
+      shootStyle = Math.max(0, Math.min(1, shootStyle));
+      return shootStyle < 0.5 ? 'placed' : 'power';
     }
 
     case 'tackle':
@@ -426,17 +387,6 @@ function selectAction(rng, situation, tactics, playerAttrs) {
     default:
       return 'normal';
   }
-}
-
-// ── 加权随机选择 ──
-function weightedRandom(rng, options, weights) {
-  const total = weights.reduce((a, b) => a + b, 0);
-  let r = rng.random() * total;
-  for (let i = 0; i < options.length; i++) {
-    r -= weights[i];
-    if (r <= 0) return options[i];
-  }
-  return options[options.length - 1];
 }
 
 // ── 执行动作（调用新模块）──
