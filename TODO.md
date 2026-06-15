@@ -30,3 +30,21 @@
 - **盘带**：5 种离散 weights(21 个魔数) → 连续 dribbleStyle(0-1)，属性+情境决定
 - **射门**：4 种离散 weights(26 个魔数) → 高空球物理强制(凌空/头球)，地面球连续 shootStyle(0-1)
 - 删除了 `weightedRandom` 工具函数
+
+## 100场决策审计修复 ✅ 已完成
+- **问题**：audit_decisions.js 在 `origStep()` 之前读取 `ball_zone`，但 `step()` 内部 `_pickNonGkCarrier()` 可能在 `determineSituation` 之前修改 `ball_zone`（当 `ball_carrier === null` 时）
+- **修复**：audit 改为在 `origStep()` 返回后使用 `result.zone`（即决策时的实际 zone）
+- **发现**：原 "MID_D shoot" 异常全部是误判——实际决策时球已在 DEEP_A/MID_A，audit 错误关联到了上一步结束时的 MID_D
+- **当前异常**（47个）：
+  - BOX_D dribble（31次）：禁区盘带，需评估是否物理合理
+  - BOX_A hiXG dribble（16次）：禁区高xG低压力盘带，可能应优先射门
+
+## shootUtility 个性化 ✅ 待实现
+- **问题**：当前 `shootUtility = xG` 线性，CM和ST在35米射门概率一样=2.46%
+- **正确方案**（非阈值拍脑袋，基于物理现实+个人+战术）：
+  - `shootWillingness` 预留参数，默认 0，将来由战术系统/个性系统填入正值或负值
+  - 比赛时间压力：最后 10 分钟，shootWillingness 自动提高
+  - 球员属性：`自信`越高、`团队`越低 → 越倾向射门
+  - 不按"角色"做判断（角色不是固定标签）
+- **涉及文件**：`situations.js` → `shootUtility` + `decisionProbs`
+- **依赖模块**：战术指令系统、球员个性系统（均未实现，但预留接口）
