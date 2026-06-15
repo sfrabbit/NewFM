@@ -696,6 +696,7 @@ class MatchEngine {
       setPiece: this.set_piece,
       realDefDist: realDefDist,
       realPressure: Math.max(0, Math.min(1, 1 - (realDefDist - 0.3) / 4.7)),
+      match_minute: this.minute,
     };
 
     // 1. 情境判断（传入持球者属性，让球员自己做决策）

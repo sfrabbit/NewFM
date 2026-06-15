@@ -39,7 +39,14 @@ function buildContext(ballZone, opponentZones, matchContext = {}) {
     defInLane,
     fatigue: matchContext.fatigue || 0,
     speedDiff: matchContext.speedDiff || 0,
-    angle: ballZone[1] * 18,
+    // zone格式: "V_BAND_LANE", 如 "MID_D_L", "BOX_A_CR"
+    // 从zone string提取lane: L=0, CL=1, C=2, CR=3, R=4 → 乘以18得角度
+    angle: (() => {
+      const parts = String(ballZone).split('_');
+      const laneCode = parts[2] || 'C';
+      const laneIdx = { L: 0, CL: 1, C: 2, CR: 3, R: 4 }[laneCode];
+      return (laneIdx != null ? laneIdx : 2) * 18;
+    })(),
     setPiece: matchContext.setPiece || 'none',
     ballHeight: Math.random() * 0.7 + 0.15,
     isFromClose: v === 'BOX_D' || v === 'BOX_A',
@@ -65,12 +72,17 @@ function buildContext(ballZone, opponentZones, matchContext = {}) {
 
 // ── 决策模型 ──
 // 射门/传球/盘带各自独立计算效用值，不互加减，用 softmax 比较
-// 每种行动的效用由物理条件决定，球员属性不影响决策（只影响执行质量）
+// 物理条件决定机会基线，球员属性 + 战术做个人化加权
 
-// ── 射门效用 = f(xG) ──
+// ── 射门效用 = f(xG, personalModifier) ──
 // xG 编码了距离+角度+压力 → 机会越好，射门效用越高
-function shootUtility(xgValue) {
-  return xgValue;
+// personalModifier 综合以下因素：
+//   + shootWillingness   (战术预留，默认0，将来可正可负)
+//   + timePressureBonus  (比赛最后10分钟，0 → 0.3)
+//   + (自信-10)*0.02     (自信高 → 更敢射)
+//   + (10-团队)*0.02     (团队低 → 更爱单干)
+function shootUtility(xgValue, personalModifier = 0) {
+  return xgValue * Math.exp(personalModifier);
 }
 
 // ── 传球效用 = f(zone, pressure) ──
@@ -99,7 +111,8 @@ function dribbleUtility(v, pressure, xgValue) {
 function estimateXG(v, ctx) {
   if (v === 'BOX_D' || v === 'DEEP_D') return 0;
   const d = ctx.distance || 25;
-  const angle = ctx.angle || 45;
+  // 注意：angle=0 是合法值（边线窄角度），不能用 || 短路
+  const angle = (ctx.angle != null) ? ctx.angle : 45;
   const pressure = ctx.pressure || 0;
   const aRad = angle * Math.PI / 180;
   const z = 0.2 - d * 0.16 + aRad * 0.7 - pressure * 1.0;
@@ -107,10 +120,25 @@ function estimateXG(v, ctx) {
 }
 
 // ── 综合决策 ──
-function decisionProbs(ballZone, role, attrs, pressure, tacticPos, xgValue) {
+// shootWillingness: 战术指令预留（默认0，将来可正可负）
+// matchMinute: 比赛分钟数（用于时间压力计算）
+// attrs: 球员属性 { 自信, 团队, ... }
+function decisionProbs(ballZone, role, attrs, pressure, tacticPos, xgValue, shootWillingness = 0, matchMinute = 0) {
   const v = getZoneV(ballZone);
   const xg = xgValue !== undefined ? xgValue : 0.1;
-  const shootU  = shootUtility(xg);
+
+  // ── 个人因素加权 ──
+  // shootWillingness: 战术预留（将来由战术系统/个性系统填入）
+  // timePressure: 最后10分钟+ 迫近射门倾向
+  const timePressureBonus = (matchMinute >= 80) ? Math.min(0.3, (matchMinute - 80) / 10 * 0.3) : 0;
+  // 球员个性：自信↑ → 更敢射；团队↓ → 更爱单干
+  const confidence = (attrs['自信'] != null) ? attrs['自信'] : 10;
+  const teamwork = (attrs['团队'] != null) ? attrs['团队'] : 10;
+  const personalityBonus = (confidence - 10) * 0.02 + (10 - teamwork) * 0.02;
+
+  const personalModifier = shootWillingness + timePressureBonus + personalityBonus;
+
+  const shootU  = shootUtility(xg, personalModifier);
   const passU   = passUtility(v, pressure);
   const dribbleU = dribbleUtility(v, pressure, xg);
 
@@ -214,7 +242,7 @@ function determineSituation(rng, ballZone, carrierRole, carrierAttrs, possession
     // 禁区持球：决策
     if (/^(ST_|W_|IF_|AM_)/.test(carrierRole)) {
       const xg = estimateXG(v, ctx);
-      const { pShoot, pPass, pDribble } = decisionProbs(ballZone, carrierRole, carrierAttrs, ctx.pressure, undefined, xg);
+      const { pShoot, pPass, pDribble } = decisionProbs(ballZone, carrierRole, carrierAttrs, ctx.pressure, undefined, xg, 0, matchContext.match_minute || 0);
       const r = rng.random();
       if (r < pShoot) {
         console.log(`\n[SHOT] zone=${ballZone} role=${carrierRole} xg=${xg.toFixed(4)} pShoot=${(pShoot*100).toFixed(2)}% r=${r.toFixed(4)} -> boxShot`);
@@ -250,7 +278,7 @@ function determineSituation(rng, ballZone, carrierRole, carrierAttrs, possession
     }
     if (/^(ST_|W_|IF_|AM_)/.test(carrierRole)) {
       const xg = estimateXG(v, ctx);
-      const { pShoot, pPass, pDribble } = decisionProbs(ballZone, carrierRole, carrierAttrs, ctx.pressure, undefined, xg);
+      const { pShoot, pPass, pDribble } = decisionProbs(ballZone, carrierRole, carrierAttrs, ctx.pressure, undefined, xg, 0, matchContext.match_minute || 0);
       const r = rng.random();
       if (r < pShoot) {
         console.log(`\n[SHOT] zone=${ballZone} role=${carrierRole} xg=${xg.toFixed(4)} pShoot=${(pShoot*100).toFixed(2)}% r=${r.toFixed(4)} -> attackShot`);
@@ -277,7 +305,7 @@ function determineSituation(rng, ballZone, carrierRole, carrierAttrs, possession
         return { type: 'tackle', subType: 'counterPress', context: ctx };
       }
       const xg = estimateXG(v, ctx);
-      const { pPass, pDribble } = decisionProbs(ballZone, carrierRole, carrierAttrs, ctx.pressure, undefined, xg);
+      const { pPass, pDribble } = decisionProbs(ballZone, carrierRole, carrierAttrs, ctx.pressure, undefined, xg, 0, matchContext.match_minute || 0);
       if (rng.random() < pDribble / (pDribble + pPass)) {
         return { type: 'dribble', subType: 'counter', context: ctx };
       }
@@ -287,10 +315,13 @@ function determineSituation(rng, ballZone, carrierRole, carrierAttrs, possession
     // 进攻球员在中场前区：决策
     if (/^(ST_|W_|IF_|AM_)/.test(carrierRole)) {
       const xg = estimateXG(v, ctx);
-      const { pShoot, pPass, pDribble } = decisionProbs(ballZone, carrierRole, carrierAttrs, ctx.pressure, undefined, xg);
+      const { pShoot, pPass, pDribble } = decisionProbs(ballZone, carrierRole, carrierAttrs, ctx.pressure, undefined, xg, 0, matchContext.match_minute || 0);
       const r = rng.random();
       if (r < pShoot) {
-        console.log(`\n[SHOT] zone=${ballZone} role=${carrierRole} xg=${xg.toFixed(4)} pShoot=${(pShoot*100).toFixed(2)}% r=${r.toFixed(4)} -> longShot`);
+        const tBonus = (matchContext.match_minute >= 80) ? Math.min(0.3, (matchContext.match_minute - 80) / 10 * 0.3) : 0;
+        const conf = (carrierAttrs['自信'] != null) ? carrierAttrs['自信'] : 10;
+        const tmwk = (carrierAttrs['团队'] != null) ? carrierAttrs['团队'] : 10;
+        console.log(`\n[SHOT] zone=${ballZone} role=${carrierRole} xg=${xg.toFixed(4)} pShoot=${(pShoot*100).toFixed(2)}% r=${r.toFixed(4)} time=${matchContext.match_minute || 0}' conf=${conf} team=${tmwk} tBonus=${tBonus.toFixed(2)} -> longShot`);
         return { type: 'shoot', subType: 'longShot', context: ctx };
       }
       if (r < pShoot + pPass) return { type: 'pass', subType: 'attackPass', context: ctx };
@@ -300,13 +331,16 @@ function determineSituation(rng, ballZone, carrierRole, carrierAttrs, possession
     // 中场控制：决策 + 争顶
     {
       const xg = estimateXG(v, ctx);
-      const { pShoot, pPass, pDribble } = decisionProbs(ballZone, carrierRole, carrierAttrs, ctx.pressure, undefined, xg);
+      const { pShoot, pPass, pDribble } = decisionProbs(ballZone, carrierRole, carrierAttrs, ctx.pressure, undefined, xg, 0, matchContext.match_minute || 0);
       if (contestCheck()) {
         return { type: 'contest', subType: 'midfieldContest', context: { ...ctx, intent: 'possession' } };
       }
       const r = rng.random();
       if (r < pShoot) {
-        console.log(`\n[SHOT] zone=${ballZone} role=${carrierRole} xg=${xg.toFixed(4)} pShoot=${(pShoot*100).toFixed(2)}% r=${r.toFixed(4)} -> longShot`);
+        const tBonus = (matchContext.match_minute >= 80) ? Math.min(0.3, (matchContext.match_minute - 80) / 10 * 0.3) : 0;
+        const conf = (carrierAttrs['自信'] != null) ? carrierAttrs['自信'] : 10;
+        const tmwk = (carrierAttrs['团队'] != null) ? carrierAttrs['团队'] : 10;
+        console.log(`\n[SHOT] zone=${ballZone} role=${carrierRole} xg=${xg.toFixed(4)} pShoot=${(pShoot*100).toFixed(2)}% r=${r.toFixed(4)} time=${matchContext.match_minute || 0}' conf=${conf} team=${tmwk} tBonus=${tBonus.toFixed(2)} -> longShot`);
         return { type: 'shoot', subType: 'longShot', context: ctx };
       }
       if (r < pShoot + pPass) return { type: 'pass', subType: 'midfieldPass', context: ctx };
