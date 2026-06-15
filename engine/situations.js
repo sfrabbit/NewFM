@@ -245,7 +245,6 @@ function determineSituation(rng, ballZone, carrierRole, carrierAttrs, possession
       const { pShoot, pPass, pDribble } = decisionProbs(ballZone, carrierRole, carrierAttrs, ctx.pressure, undefined, xg, 0, matchContext.match_minute || 0);
       const r = rng.random();
       if (r < pShoot) {
-        console.log(`\n[SHOT] zone=${ballZone} role=${carrierRole} xg=${xg.toFixed(4)} pShoot=${(pShoot*100).toFixed(2)}% r=${r.toFixed(4)} -> boxShot`);
         return { type: 'shoot', subType: 'boxShot', context: ctx };
       }
       if (r < pShoot + pPass) return { type: 'pass', subType: 'boxPass', context: ctx };
@@ -281,7 +280,6 @@ function determineSituation(rng, ballZone, carrierRole, carrierAttrs, possession
       const { pShoot, pPass, pDribble } = decisionProbs(ballZone, carrierRole, carrierAttrs, ctx.pressure, undefined, xg, 0, matchContext.match_minute || 0);
       const r = rng.random();
       if (r < pShoot) {
-        console.log(`\n[SHOT] zone=${ballZone} role=${carrierRole} xg=${xg.toFixed(4)} pShoot=${(pShoot*100).toFixed(2)}% r=${r.toFixed(4)} -> attackShot`);
         return { type: 'shoot', subType: 'attackShot', context: ctx };
       }
       if (r < pShoot + pPass) return { type: 'pass', subType: 'finalThirdPass', context: ctx };
@@ -318,10 +316,6 @@ function determineSituation(rng, ballZone, carrierRole, carrierAttrs, possession
       const { pShoot, pPass, pDribble } = decisionProbs(ballZone, carrierRole, carrierAttrs, ctx.pressure, undefined, xg, 0, matchContext.match_minute || 0);
       const r = rng.random();
       if (r < pShoot) {
-        const tBonus = (matchContext.match_minute >= 80) ? Math.min(0.3, (matchContext.match_minute - 80) / 10 * 0.3) : 0;
-        const conf = (carrierAttrs['自信'] != null) ? carrierAttrs['自信'] : 10;
-        const tmwk = (carrierAttrs['团队'] != null) ? carrierAttrs['团队'] : 10;
-        console.log(`\n[SHOT] zone=${ballZone} role=${carrierRole} xg=${xg.toFixed(4)} pShoot=${(pShoot*100).toFixed(2)}% r=${r.toFixed(4)} time=${matchContext.match_minute || 0}' conf=${conf} team=${tmwk} tBonus=${tBonus.toFixed(2)} -> longShot`);
         return { type: 'shoot', subType: 'longShot', context: ctx };
       }
       if (r < pShoot + pPass) return { type: 'pass', subType: 'attackPass', context: ctx };
@@ -337,10 +331,6 @@ function determineSituation(rng, ballZone, carrierRole, carrierAttrs, possession
       }
       const r = rng.random();
       if (r < pShoot) {
-        const tBonus = (matchContext.match_minute >= 80) ? Math.min(0.3, (matchContext.match_minute - 80) / 10 * 0.3) : 0;
-        const conf = (carrierAttrs['自信'] != null) ? carrierAttrs['自信'] : 10;
-        const tmwk = (carrierAttrs['团队'] != null) ? carrierAttrs['团队'] : 10;
-        console.log(`\n[SHOT] zone=${ballZone} role=${carrierRole} xg=${xg.toFixed(4)} pShoot=${(pShoot*100).toFixed(2)}% r=${r.toFixed(4)} time=${matchContext.match_minute || 0}' conf=${conf} team=${tmwk} tBonus=${tBonus.toFixed(2)} -> longShot`);
         return { type: 'shoot', subType: 'longShot', context: ctx };
       }
       if (r < pShoot + pPass) return { type: 'pass', subType: 'midfieldPass', context: ctx };
