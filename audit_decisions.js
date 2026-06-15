@@ -55,19 +55,22 @@ for (let i = 0; i < N; i++) {
   const mx = new MatchEngine(home, away, i * 100 + 777);
 
   // Hook step to capture xG/pressure at decision time
+  // 注意：必须在 determineSituation 调用后读取 ball_zone，因为 _pickNonGkCarrier()
+  // 可能在 step 开始时修改 ball_zone（当 ball_carrier === null 时）
   const origStep = mx.step.bind(mx);
   mx.step = function() {
-    // Calculate from current state BEFORE step
-    const defDist = this._ballDefDist ? this._ballDefDist() : 25;
-    const pressure = Math.max(0, Math.min(1, 1 - (defDist - 0.3) / 4.7));
-    const zone = this.ball_zone;
-    const v = getZoneV(zone);
-    const d = distMap[v] || 25;
-    const angle = zone ? zone[1] * 18 : 0;
-    const xg = estimateXG(v, { distance: d, angle: angle, pressure: pressure });
-
     const result = origStep();
     if (!result) return result;
+
+    // 用 result 中记录的 zone（即决策时的实际 zone）
+    const zone = result.zone || this.ball_zone || 'MID_D_C';
+    const v = getZoneV(zone);
+    const defDist = this._ballDefDist ? this._ballDefDist() : 25;
+    const pressure = Math.max(0, Math.min(1, 1 - (defDist - 0.3) / 4.7));
+    const d = distMap[v] || 25;
+    const angle = zone ? zone.split('_')[1] : 'C';
+    const angleDeg = {L:0, CL:1, C:2, CR:3, R:4}[angle] || 2;
+    const xg = estimateXG(v, { distance: d, angle: angleDeg * 18, pressure: pressure });
 
     recordAction(zone || '?', v, result.type, result.subType, xg, pressure, defDist);
     totalActions++;

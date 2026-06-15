@@ -69,7 +69,12 @@ function buildContext(ballZone, opponentZones, matchContext = {}) {
 
 // ── 射门效用 = f(xG) ──
 // xG 编码了距离+角度+压力 → 机会越好，射门效用越高
+// 物理现实：职业球员不会选择 xG < 0.02 的射门（约18-20m普通角度）
+// 低于此阈值时射门效用归零，除非比赛最后时刻的 desperation shot（暂不模拟）
+const MIN_XG_TO_SHOOT = 0.02;
+
 function shootUtility(xgValue) {
+  if (xgValue < MIN_XG_TO_SHOOT) return 0;
   return xgValue;
 }
 
