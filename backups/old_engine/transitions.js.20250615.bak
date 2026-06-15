@@ -1,0 +1,389 @@
+// Ball transition resolver. Mirrors match_engine_v2_1.py resolve_ball_transition()
+// + helper navigators (forward/backward/cross-field).
+const {
+  V_BAND_ORDER, H_LANE_ORDER, getZoneV, getZoneH,
+} = require("./zones");
+const { findNearestOpponent } = require("./teams");
+
+function getAdjacentZoneForward(rng, zoneId) {
+  const v = getZoneV(zoneId), h = getZoneH(zoneId);
+  const vi = V_BAND_ORDER.indexOf(v);
+  if (vi >= V_BAND_ORDER.length - 1) return zoneId;
+  const nextV = V_BAND_ORDER[vi + 1];
+  const baseH = (h === "ALL" || !H_LANE_ORDER.includes(h)) ? "C" : h;
+  let nh = baseH;
+  if (rng.random() < 0.3) {
+    let hi = H_LANE_ORDER.indexOf(baseH);
+    hi = Math.max(0, Math.min(4, hi + (rng.random() < 0.5 ? -1 : 1)));
+    nh = H_LANE_ORDER[hi];
+  }
+  return `${nextV}_${nh}`;
+}
+
+function getAdjacentZoneBackward(zoneId) {
+  const v = getZoneV(zoneId), h = getZoneH(zoneId);
+  const vi = V_BAND_ORDER.indexOf(v);
+  if (vi <= 0) return zoneId;
+  const prevV = V_BAND_ORDER[vi - 1];
+  const baseH = (h === "ALL" || !H_LANE_ORDER.includes(h)) ? "C" : h;
+  return `${prevV}_${baseH}`;
+}
+
+function getCrossFieldZone(rng, zoneId) {
+  const v = getZoneV(zoneId), h = getZoneH(zoneId);
+  const baseH = (h === "ALL" || !H_LANE_ORDER.includes(h)) ? "C" : h;
+  const opp = { L: "R", CL: "CR", C: "C", CR: "CL", R: "L" };
+  const nh = opp[baseH] || baseH;
+  let vBand = V_BAND_ORDER.indexOf(v);
+  // 70% no shift, 30% shift back by 1 (matches choice([0,0,1]))
+  vBand = Math.max(0, vBand - (rng.random() < 1 / 3 ? 1 : 0));
+  const nv = V_BAND_ORDER[vBand];
+  return `${nv}_${nh}`;
+}
+
+// Result tuple: [newZone, newCarrierTeam, newCarrierPid, followUp, possessionChange]
+function resolveBallTransition(rng, sid, aid, success, ballZone, carrierTeam, carrierPid,
+                                teamA, teamB, attZones, defZones) {
+  const attTeam = carrierTeam;
+  const defTeam = attTeam === "home" ? "away" : "home";
+  const attTeamObj = attTeam === "home" ? teamA : teamB;
+  const defTeamObj = attTeam === "home" ? teamB : teamA;
+  const v = getZoneV(ballZone);
+  const h = getZoneH(ballZone);
+
+  // Helper to grab the nearest defender to ballZone (to receive the loose ball)
+  const defGrab = (zone = ballZone, follow = null) => {
+    const [pid] = defTeamObj.findNearestTeammate(zone, defZones);
+    if (pid) return [zone, defTeam, pid, follow, true];
+    return [zone, defTeam, "unknown", follow, true];
+  };
+
+  // ── S01/S02 ──
+  if (sid === "S01" || sid === "S02") {
+    if (success) {
+      if (aid === "A1") {
+        const [pid] = attTeamObj.findNearestTeammate(ballZone, attZones, carrierPid, true);
+        if (pid) return [attZones[pid][0], attTeam, pid, null, false];
+      } else if (aid === "A2" || aid === "A3") {
+        if (rng.random() < 0.4) {
+          const tgt = getCrossFieldZone(rng, getAdjacentZoneForward(rng, ballZone));
+          for (const [pid, [z]] of Object.entries(attZones)) {
+            if (getZoneV(z) === getZoneV(tgt) && pid !== carrierPid) {
+              return [z, attTeam, pid, null, false];
+            }
+          }
+        }
+        const fwd = Object.entries(attZones).filter(
+          ([pid, [z]]) => ["MID_A", "DEEP_A"].includes(getZoneV(z)) && pid !== carrierPid
+        );
+        if (fwd.length > 0) {
+          const [pid, [z]] = fwd[Math.floor(rng.random() * fwd.length)];
+          return [z, attTeam, pid, null, false];
+        }
+        return defGrab(getAdjacentZoneForward(rng, ballZone));
+      } else if (aid === "A4") {
+        return [getAdjacentZoneForward(rng, ballZone), attTeam, carrierPid, null, false];
+      }
+    } else {
+      return defGrab();
+    }
+  }
+
+  // ── S03 ──
+  if (sid === "S03") {
+    if (success) {
+      if (aid === "A1") {
+        const backZ = getAdjacentZoneBackward(ballZone);
+        const [pid] = attTeamObj.findNearestTeammate(backZ, attZones, carrierPid, false);
+        if (pid) return [attZones[pid][0], attTeam, pid, null, false];
+      } else if (aid === "A2") {
+        return [getAdjacentZoneForward(rng, ballZone), attTeam, carrierPid, null, false];
+      } else if (aid === "A3" || aid === "A4") {
+        for (const [pid, [z]] of Object.entries(attZones)) {
+          if (pid === carrierPid) continue;
+          const lh = getZoneH(z);
+          if ((lh === "L" || lh === "R") && getZoneV(z) === v) {
+            return [z, attTeam, pid, null, false];
+          }
+        }
+        const [pid] = attTeamObj.findNearestTeammate(ballZone, attZones, carrierPid, true);
+        if (pid) return [attZones[pid][0], attTeam, pid, null, false];
+      }
+    } else {
+      return defGrab();
+    }
+  }
+
+  // ── S04 ──
+  if (sid === "S04") {
+    if (success) {
+      if (aid === "A1" || aid === "A2") {
+        const [pid] = attTeamObj.findNearestTeammate(ballZone, attZones, carrierPid, true);
+        if (pid) return [attZones[pid][0], attTeam, pid, null, false];
+      } else if (aid === "A3") {
+        if (rng.random() < 0.5) {
+          const tgt = getCrossFieldZone(rng, ballZone);
+          for (const [pid, [z]] of Object.entries(attZones)) {
+            if (z === tgt && pid !== carrierPid) return [z, attTeam, pid, null, false];
+          }
+        }
+        const fwd = Object.entries(attZones).filter(
+          ([pid, [z]]) => ["DEEP_A", "BOX_A"].includes(getZoneV(z)) && pid !== carrierPid
+        );
+        if (fwd.length > 0) {
+          const [, [tz]] = fwd[Math.floor(rng.random() * fwd.length)];
+          for (const [pid, [z]] of Object.entries(attZones)) {
+            if (z === tz) return [z, attTeam, pid, null, false];
+          }
+        }
+      } else if (aid === "A4") {
+        return ["BOX_A_C", attTeam, carrierPid, "through_ball_arrives", false];
+      } else if (aid === "A5") {
+        return [getAdjacentZoneForward(rng, ballZone), attTeam, carrierPid, null, false];
+      }
+    } else {
+      return defGrab();
+    }
+  }
+
+  // ── S05 ──
+  if (sid === "S05") {
+    if (success) {
+      if (aid === "A1" || aid === "A2") {
+        const tgt = aid === "A1" ? `BOX_A_${H_LANE_ORDER.includes(h) ? h : "C"}` : `DEEP_A_${h}`;
+        const follow = aid === "A1" ? "cross_arrives" : null;
+        for (const [pid, [z]] of Object.entries(attZones)) {
+          if (z === tgt && pid !== carrierPid) return [tgt, attTeam, pid, follow, false];
+        }
+        for (const [pid, [z]] of Object.entries(attZones)) {
+          if (["BOX_A", "DEEP_A"].includes(getZoneV(z)) && pid !== carrierPid) {
+            return [z, attTeam, pid, follow, false];
+          }
+        }
+      } else if (aid === "A3") {
+        return [ballZone, attTeam, carrierPid, "shot_on_target", false];
+      } else if (aid === "A4") {
+        return [`BOX_A_${H_LANE_ORDER.includes(h) ? h : "C"}`, attTeam, carrierPid, null, false];
+      } else if (aid === "A5") {
+        const backZ = getAdjacentZoneBackward(ballZone);
+        const [pid] = attTeamObj.findNearestTeammate(backZ, attZones, carrierPid, false);
+        if (pid) return [attZones[pid][0], attTeam, pid, null, false];
+      }
+    } else {
+      const [pid] = defTeamObj.findNearestTeammate(ballZone, defZones);
+      const f = rng.random() < 0.3 ? "corner" : "throw_in";
+      if (pid) return [ballZone, defTeam, pid, f, true];
+      return [ballZone, defTeam, "unknown", f, true];
+    }
+  }
+
+  // ── S06 ──
+  if (sid === "S06") {
+    if (success) {
+      if (aid === "A1") {
+        for (const [pid, [z]] of Object.entries(attZones)) {
+          if (getZoneV(z) === "BOX_A" && pid !== carrierPid) {
+            return [z, attTeam, pid, "cross_arrives", false];
+          }
+        }
+        return [`BOX_A_${H_LANE_ORDER.includes(h) ? h : "C"}`, attTeam, carrierPid, "cross_arrives", false];
+      }
+      if (aid === "A2") return [ballZone, attTeam, carrierPid, "shot_on_target", false];
+      if (aid === "A3") {
+        for (const [pid, [z]] of Object.entries(attZones)) {
+          const lh = getZoneH(z), lv = getZoneV(z);
+          if (["C","CL","CR"].includes(lh) && ["MID_A","DEEP_A"].includes(lv) && pid !== carrierPid) {
+            return [z, attTeam, pid, null, false];
+          }
+        }
+      }
+      if (aid === "A4") return [getAdjacentZoneForward(rng, ballZone), attTeam, carrierPid, null, false];
+      if (aid === "A5") {
+        const backZ = getAdjacentZoneBackward(ballZone);
+        const [pid] = attTeamObj.findNearestTeammate(backZ, attZones, carrierPid, false);
+        if (pid) return [attZones[pid][0], attTeam, pid, null, false];
+      }
+      if (aid === "A6") {
+        const advZ = getZoneV(ballZone) === "DEEP_A" ? `BOX_A_${H_LANE_ORDER.includes(h) ? h : "C"}` : getAdjacentZoneForward(rng, ballZone);
+        return [advZ, attTeam, carrierPid, null, false];
+      }
+    } else {
+      const [pid] = defTeamObj.findNearestTeammate(ballZone, defZones);
+      const follow = rng.random() < 0.5 ? "throw_in" : "corner";
+      if (pid) return [ballZone, defTeam, pid, follow, true];
+      return [ballZone, defTeam, "unknown", follow, true];
+    }
+  }
+
+  // ── S07 ──
+  if (sid === "S07") {
+    if (success) return [`BOX_A_${H_LANE_ORDER.includes(h) ? h : "C"}`, attTeam, carrierPid, "through_ball_arrives", false];
+    return defGrab();
+  }
+
+  // ── S08 ──
+  if (sid === "S08") {
+    if (success) {
+      if (aid === "A1") {
+        const backZ = getAdjacentZoneBackward(ballZone);
+        const [pid] = attTeamObj.findNearestTeammate(backZ, attZones, carrierPid, false);
+        if (pid) return [attZones[pid][0], attTeam, pid, null, false];
+      }
+      if (aid === "A2") return [ballZone, attTeam, carrierPid, "shot_on_target", false];
+      if (aid === "A3") return [getAdjacentZoneForward(rng, ballZone), attTeam, carrierPid, null, false];
+      if (aid === "A4") {
+        const [pid] = attTeamObj.findNearestTeammate(ballZone, attZones, carrierPid, true);
+        if (pid) return [attZones[pid][0], attTeam, pid, null, false];
+      }
+    } else {
+      return defGrab();
+    }
+  }
+
+  // ── S09 ──
+  if (sid === "S09") {
+    if (success) {
+      if (aid === "A1") {
+        const vi = V_BAND_ORDER.indexOf(v);
+        const nv = V_BAND_ORDER[Math.min(5, vi + 2)];
+        const baseH = H_LANE_ORDER.includes(h) ? h : "C";
+        return [`${nv}_${baseH}`, attTeam, carrierPid, null, false];
+      }
+      if (aid === "A2" || aid === "A3") {
+        const target = aid === "A3" ? "BOX_A_C"
+                     : (["L","CL"].includes(h) ? "DEEP_A_L" : "DEEP_A_R");
+        for (const [pid, [z]] of Object.entries(attZones)) {
+          if (z === target && pid !== carrierPid) return [target, attTeam, pid, null, false];
+        }
+        return [getAdjacentZoneForward(rng, ballZone), attTeam, carrierPid, null, false];
+      }
+      if (aid === "A4") return [ballZone, attTeam, carrierPid, null, false];
+    } else {
+      return defGrab();
+    }
+  }
+
+  // ── S10/S11/S12 ──
+  if (sid === "S10" || sid === "S11" || sid === "S12") {
+    if (aid === "A2" || aid === "A3" || aid === "A4") {
+      if (sid === "S11" && (aid === "A2" || aid === "A3")) {
+        if (success) return [ballZone, attTeam, carrierPid, null, false];
+        return defGrab();
+      }
+      if (sid === "S10" && aid === "A2") {
+        if (success) {
+          const [pid] = attTeamObj.findNearestTeammate(ballZone, attZones, carrierPid, true);
+          if (pid) return [attZones[pid][0], attTeam, pid, null, false];
+        } else {
+          return defGrab();
+        }
+      }
+      return [ballZone, attTeam, carrierPid, null, false];
+    }
+    return resolveShot(rng, sid, aid, success, ballZone, attTeam, carrierPid);
+  }
+
+  // ── S13 ──
+  if (sid === "S13") {
+    if (success) {
+      if (aid === "A1" || aid === "A2" || aid === "A4") {
+        if (rng.random() < 0.06) return [ballZone, attTeam, carrierPid, "goal", false];
+        return [ballZone, attTeam, carrierPid, "shot_on_target", false];
+      }
+      if (aid === "A3") {
+        const midZones = ["MID_A_C","MID_A_L","MID_A_R","MID_D_C"];
+        const toZ = midZones[Math.floor(rng.random() * midZones.length)];
+        for (const [dpid, [dz]] of Object.entries(defZones)) {
+          if (getZoneV(dz) === getZoneV(toZ)) return [toZ, defTeam, dpid, null, true];
+        }
+        const [dpid] = findNearestOpponent(toZ, defZones);
+        if (dpid) return [toZ, defTeam, dpid, null, true];
+        // Fallback: use any defensive player, never the attacker's carrierPid
+        const fallbackDpid = Object.keys(defZones)[0] || "unknown";
+        return [toZ, defTeam, fallbackDpid, null, true];
+      }
+    } else {
+      return defGrab();
+    }
+  }
+
+  // ── S14 ──
+  if (sid === "S14") {
+    if (success) return [ballZone, attTeam, carrierPid, "goal", false];
+    if (rng.random() < 0.3) {
+      return [ballZone, defTeam, Object.keys(defZones)[0], "corner", true];
+    }
+    for (const [pid, [z, role]] of Object.entries(defZones)) {
+      if (role === "GK") return [z, defTeam, pid, null, true];
+    }
+  }
+
+  // ── S15/S16/S17/S18 ──
+  if (["S15","S16","S17","S18"].includes(sid)) {
+    if (success) return [ballZone, defTeam, carrierPid, null, true];
+    const attCarrier = Object.keys(attZones)[0];
+    if (sid === "S17") return ["BOX_A_C", attTeam, attCarrier, null, false];
+    return [ballZone, attTeam, attCarrier, null, false];
+  }
+
+  // ── S20 ──
+  if (sid === "S20") {
+    if (success) {
+      if (aid === "A1" || aid === "A3") {
+        const [pid] = attTeamObj.findNearestTeammate("DEEP_D_C", attZones, carrierPid, true);
+        if (pid) return [attZones[pid][0], attTeam, pid, null, false];
+      }
+      if (aid === "A2" || aid === "A4" || aid === "A1" || aid === "A3") {
+        for (const [pid, [z, role]] of Object.entries(attZones)) {
+          if (["MID_A","DEEP_A"].includes(getZoneV(z)) && role !== "GK") {
+            return [z, attTeam, pid, null, false];
+          }
+        }
+        return ["MID_D_C", attTeam, carrierPid, null, false];
+      }
+    } else {
+      const [pid] = defTeamObj.findNearestTeammate("MID_A_C", defZones);
+      if (pid) return ["MID_A_C", defTeam, pid, null, true];
+    }
+  }
+
+  // ── S22 ──
+  if (sid === "S22") {
+    if (success) {
+      for (const [pid, [z, role]] of Object.entries(attZones)) {
+        if (getZoneV(z) === "BOX_A" && role !== "GK") {
+          return [z, attTeam, pid, "cross_arrives", false];
+        }
+      }
+      return [`BOX_A_${H_LANE_ORDER.includes(h) ? h : "C"}`, attTeam, carrierPid, "cross_arrives", false];
+    }
+    const [pid] = defTeamObj.findNearestTeammate("BOX_A_C", defZones);
+    if (pid) return [defZones[pid][0], defTeam, pid, null, true];
+  }
+
+  // ── S23 ──
+  if (sid === "S23") {
+    if (success) {
+      const [pid] = attTeamObj.findNearestTeammate(ballZone, attZones, carrierPid, true);
+      if (pid) return [attZones[pid][0], attTeam, pid, null, false];
+    } else {
+      return defGrab();
+    }
+  }
+
+  // ── fallback ──
+  return [ballZone, attTeam, carrierPid, null, false];
+}
+
+function resolveShot(rng, sid, aid, success, ballZone, attTeam, carrierPid) {
+  if (success) {
+    if (rng.random() < 0.06) return [ballZone, attTeam, carrierPid, "goal", false];
+    return [ballZone, attTeam, carrierPid, "shot_saved", false];
+  }
+  return [ballZone, attTeam, carrierPid, "shot_miss", false];
+}
+
+module.exports = {
+  getAdjacentZoneForward, getAdjacentZoneBackward, getCrossFieldZone,
+  resolveBallTransition, resolveShot,
+};

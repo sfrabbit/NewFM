@@ -1,0 +1,219 @@
+// ============================================================
+// 情境判断模块 — 新6核心系统（2026年6月重构）
+// ============================================================
+// 替代旧的 S01-S23 分类。
+// 旧文件已备份为 situations_old_s01_s23.js
+//
+// 保持与 match.js 的向后兼容：
+//   determineSituation 仍返回 [sid, context] 格式
+//   selectAction 保留（通过新模块概率计算映射到旧action ID）
+//   SITUATION_ACTIONS 保留为旧权重表的引用
+//
+// 6核心情境（2026-06-15更新）：
+//   S01 传球   → pass.js
+//   S02 盘带   → dribble.js  
+//   S03 射门   → shoot.js
+//   S04 抢断   → tackle.js    [对手有球，防守方主动发起]
+//   S05 争顶   → contest.js   [双方无确定控球，中性球争夺]
+//   S06 门将   → save.js
+//
+// 关键区分：
+//   - Tackle（抢断）：对手有明确控球，防守方主动抢断
+//   - Contest（争顶）：双方对中性球争夺，包括：
+//     * aerial/shoulder：争球权（possession意图）
+//     * clearance：解围（clearance意图）
+// ============================================================
+
+const { getZoneV, getZoneH } = require("./zones");
+const { findNearestOpponent } = require("./teams");
+
+// ── 旧权重表（保留兼容）──
+const SITUATION_ACTIONS = {
+  S01: [["A1",25,"safe"],["A2",15,"direct"],["A3",35,"clear"],["A4",25,"dribble"]],
+  S02: [["A1",40,"safe"],["A2",25,"direct"],["A3",20,"direct"],["A4",15,"dribble"]],
+  S03: [["A1",30,"safe"],["A2",25,"dribble"],["A3",30,"pass"],["A4",15,"hold"]],
+  S04: [["A1",35,"safe"],["A2",15,"hold"],["A3",15,"direct"],["A4",20,"risky"],["A5",15,"dribble"]],
+  S05: [["A1",22,"cross"],["A2",28,"pass"],["A3",14,"shot"],["A4",26,"dribble"],["A5",10,"safe"]],
+  S06: [["A1",30,"cross"],["A2",6,"shot"],["A3",22,"pass"],["A4",18,"dribble"],["A5",14,"safe"],["A6",10,"combo"]],
+  S07: [["A1",35,"risky"],["A2",25,"direct"],["A3",25,"risky"],["A4",15,"safe"]],
+  S08: [["A1",35,"hold"],["A2",10,"shot"],["A3",28,"pass"],["A4",27,"pass"]],
+  S09: [["A1",35,"dribble"],["A2",25,"pass"],["A3",25,"risky"],["A4",15,"safe"]],
+  S10: [["A1",45,"shot"],["A2",25,"pass"],["A3",30,"shot"]],
+  S11: [["A1",50,"shot"],["A2",20,"dribble"],["A3",15,"pass"],["A4",15,"shot"]],
+  S12: [["A1",30,"shot"],["A2",25,"shot"],["A3",25,"shot"],["A4",20,"shot"]],
+  S13: [["A1",35,"shot"],["A2",25,"shot"],["A3",25,"clear"],["A4",15,"safe"]],
+  S14: [["A1",60,"shot"],["A2",15,"risky"],["A3",25,"shot"]],
+  S15: [["A1",35,"tackle"],["A2",20,"safe"],["A3",25,"tackle"],["A4",20,"tackle"]],
+  S16: [["A1",40,"tackle"],["A2",30,"tackle"],["A3",30,"pass"]],
+  S17: [["A1",40,"dribble"],["A2",25,"tackle"],["A3",20,"tackle"],["A4",15,"safe"]],
+  S18: [["A1",30,"tackle"],["A2",30,"tackle"],["A3",15,"tackle"],["A4",25,"clear"]],
+  S19: [["A1",55,"save"],["A2",20,"claim"],["A3",15,"rush"],["A4",10,"safe"]],
+  S20: [["A1",30,"pass"],["A2",25,"direct"],["A3",30,"safe"],["A4",15,"direct"]],
+  S21: [["A1",40,"shot"],["A2",35,"cross"],["A3",25,"safe"]],
+  S22: [["A1",40,"cross"],["A2",40,"cross"],["A3",20,"safe"]],
+  S23: [["A1",50,"safe"],["A2",20,"direct"],["A3",30,"direct"]],
+};
+
+// ── 6核心 → 旧SID映射 ──
+const TYPE_TO_SID = {
+  pass:    { default: "S02", midfield: "S03", finalThird: "S04", buildUp: "S01", gkDistribution: "S20", throwIn: "S23" },
+  dribble: { default: "S09", counter: "S09", attackDribble: "S04", midfieldCarry: "S03", boxDribble: "S11", finalThirdDribble: "S08" },
+  shoot:   { default: "S10", longShot: "S07", attackShot: "S11", boxShot: "S12", penalty: "S14", setPiece: "S21", freeKick: "S21" },
+  tackle:  { default: "S15", midfieldTackle: "S16", recoveryTackle: "S17", boxTackle: "S18" },
+  contest: { default: "S15", aerialContest: "S16", shoulderContest: "S17", clearance: "S18" },
+  save:    { default: "S19" },
+};
+
+// ── 情境判断（新版，保留 [sid, ctx] 返回格式）──
+function determineSituation(rng, ballZone, carrierRole, possessionTeam,
+                            opponentZones, tactics, setPiece, matchContext, defenderTactics) {
+  if (setPiece === "penalty")  return ["S14", { type: "shoot", sub: "penalty" }];
+  if (setPiece === "corner")   return ["S22", { type: "shoot", sub: "setPiece" }];
+  if (setPiece === "throw_in") return ["S23", { type: "pass", sub: "throwIn" }];
+  if (setPiece === "free_kick")return ["S21", { type: "shoot", sub: "freeKick" }];
+
+  if (carrierRole === "GK") return ["S20", { type: "pass", sub: "gkDistribution" }];
+
+  const [, minDist] = findNearestOpponent(ballZone, opponentZones);
+  const pressingMod = (defenderTactics ? defenderTactics : tactics).getPressingMod();
+  const pressureDist = Math.max(0, Math.min(1, 1 - (minDist - 0.3) / 4.7));
+
+  const v = getZoneV(ballZone);
+  const h = getZoneH(ballZone);
+
+  // ── 禁区防守 ──
+  if (v === "BOX_D") {
+    if (/^(CB_|FB_|WB_|DM_|GK)/.test(carrierRole)) {
+      // 防守球员在禁区
+      if (pressureDist > 0.6) {
+        // 高压下：争顶/解围（中性球争夺）
+        return ["S18", { type: "contest", sub: "boxClearance", intent: "clearance" }];
+      }
+      return ["S01", { type: "pass", sub: "buildUp" }];
+    }
+    if (/^(ST_|W_|IF_|AM_)/.test(carrierRole)) {
+      return rng.random() < 0.7
+        ? ["S12", { type: "shoot", sub: "boxShot" }]
+        : ["S11", { type: "dribble", sub: "boxDribble" }];
+    }
+    // 其他情况：中性球争夺或解围
+    return pressureDist > 0.5
+      ? ["S18", { type: "contest", sub: "defClearance", intent: "clearance" }]
+      : ["S01", { type: "pass", sub: "defPass" }];
+  }
+
+  if (v === "DEEP_D") {
+    if (/^(CB_|FB_|WB_|DM_|GK)/.test(carrierRole)) {
+      return pressureDist > 0.6
+        ? ["S18", { type: "contest", sub: "deepClearance", intent: "clearance" }]
+        : ["S02", { type: "pass", sub: "buildUp" }];
+    }
+  }
+
+  // ── 中场 ──
+  if (v === "MID_D" || v === "MID_A") {
+    const isAttacking = v === "MID_A";
+    if (matchContext.is_transition) {
+      return rng.random() < 0.4
+        ? ["S09", { type: "dribble", sub: "counter" }]
+        : ["S02", { type: "pass", sub: "transitionPass" }];
+    }
+    if (isAttacking && /^(ST_|W_|IF_|AM_)/.test(carrierRole)) {
+      const r = rng.random();
+      if (r < 0.12) return ["S07", { type: "shoot", sub: "longShot" }];
+      if (r < 0.40) return ["S04", { type: "dribble", sub: "attackDribble" }];
+      return ["S03", { type: "pass", sub: "attackPass" }];
+    }
+    // 关键区分：
+    // - 对手有球 → tackle（抢断）
+    // - 中性球 → contest（争顶）
+    if (matchContext.opponent_has_ball) {
+      // 对手有球，发起抢断
+      if (pressureDist > 0.5 && /^(CM_|DM_|AM_)/.test(carrierRole)) {
+        return ["S15", { type: "tackle", sub: "midfieldTackle" }];
+      }
+    } else {
+      // 中性球争夺
+      if (pressureDist > 0.5 && /^(CM_|DM_|AM_)/.test(carrierRole)) {
+        return ["S16", { type: "contest", sub: "midfieldContest", intent: "possession" }];
+      }
+    }
+    const r = rng.random();
+    if (r < 0.65) return ["S03", { type: "pass", sub: "midfieldPass" }];
+    if (r < 0.90) return ["S03", { type: "dribble", sub: "midfieldCarry" }];
+    // 默认中性球争夺
+    return ["S16", { type: "contest", sub: "midfieldContest", intent: "possession" }];
+  }
+
+  // ── 前场 ──
+  if (v === "BOX_A" || v === "DEEP_A") {
+    if (/^(ST_|W_|IF_|AM_)/.test(carrierRole)) {
+      const r = rng.random();
+      if (r < 0.45) return ["S11", { type: "shoot", sub: "attackShot" }];
+      if (r < 0.75) return ["S08", { type: "pass", sub: "finalThirdPass" }];
+      return ["S08", { type: "dribble", sub: "finalThirdDribble" }];
+    }
+    if (matchContext.is_breaking_away) {
+      // 反击场景：可能是抢断或争顶
+      return matchContext.opponent_has_ball
+        ? ["S17", { type: "tackle", sub: "recoveryTackle" }]
+        : ["S17", { type: "contest", sub: "recoveryContest", intent: "possession" }];
+    }
+    return ["S08", { type: "pass", sub: "finalThirdPass" }];
+  }
+
+  // 默认：中性球争夺
+  return ["S16", { type: "contest", sub: "normal", intent: "possession" }];
+}
+
+// ── 旧动作选择器（保持向后兼容）──
+function selectAction(rng, situationId, tactics) {
+  const entries = SITUATION_ACTIONS[situationId] || [["A1", 100, "safe"]];
+  const tempo = tactics.getTempoMod();
+  const pressing = tactics.getPressingMod();
+  const weights = [];
+  for (const [aid, baseW, tag] of entries) {
+    let w = baseW;
+    if (tag === "safe"    && tempo < 0)      w *= 1.5;
+    if (tag === "safe"    && tempo > 0)      w *= 0.7;
+    if (tag === "hold"    && tempo < 0)      w *= 1.5;
+    if (tag === "hold"    && tempo > 0)      w *= 0.7;
+    if (tag === "risky"   && tempo > 0)      w *= 1.5;
+    if (tag === "risky"   && tempo < 0)      w *= 0.7;
+    if (tag === "dribble" && tempo > 0)      w *= 1.3;
+    if (tag === "dribble" && tempo < 0)      w *= 0.8;
+    if (tag === "tackle"  && pressing > 0)   w *= 1 + pressing * 0.20;
+    if (tag === "tackle"  && pressing < 0)   w *= 1 + pressing * 0.10;
+    weights.push(Math.max(1, w));
+  }
+  const total = weights.reduce((a, b) => a + b, 0);
+  let r = rng.random() * total, cum = 0;
+  for (let i = 0; i < weights.length; i++) {
+    cum += weights[i];
+    if (r <= cum) return entries[i][0];
+  }
+  return entries[entries.length - 1][0];
+}
+
+// ── 构建物理上下文 ──
+function buildContext(ballZone, opponentZones) {
+  const [, minDist] = findNearestOpponent(ballZone, opponentZones);
+  const pressure = Math.max(0, Math.min(1, 1 - (minDist - 0.3) / 4.7));
+  const v = getZoneV(ballZone);
+  const distMap = { BOX_A: 8, DEEP_A: 14, MID_A: 22, MID_D: 35, DEEP_D: 45, BOX_D: 55 };
+  const distance = distMap[v] || 25;
+  const defInLane = opponentZones.filter(z =>
+    Math.abs(z[0] - ballZone[0]) <= 1 && Math.abs(z[1] - ballZone[1]) <= 1
+  ).length;
+  return {
+    distance, pressure, defDist: minDist, defInLane,
+    fatigue: 0, speedDiff: 0,
+    angle: ballZone[1] * 18,
+    setPiece: 'none',
+    ballHeight: Math.random() * 0.7 + 0.15,
+    isFromClose: v === 'BOX_D' || v === 'BOX_A',
+    intent: 'possession',  // 默认意图：争球权
+  };
+}
+
+module.exports = { SITUATION_ACTIONS, determineSituation, selectAction, buildContext };

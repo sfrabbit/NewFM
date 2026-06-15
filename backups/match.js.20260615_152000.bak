@@ -1,0 +1,465 @@
+// ============================================================
+// 比赛引擎 — 新6核心模块系统（2026年6月重构）
+// ============================================================
+// 完全使用新的6个核心模块：
+//   pass, dribble, shoot, tackle, contest, save
+//
+// 每个事件都经过：
+//   1. 情境判断（determineSituation）
+//   2. 动作选择（selectAction）
+//   3. 模块执行（executeAction）
+//   4. 结果处理（球权转移/射门处理）
+// ============================================================
+
+const { Rng } = require("./rng");
+const { findNearestOpponent } = require("./teams");
+const { determineSituation, selectAction, executeAction, buildContext } = require("./situations");
+const { getZoneV } = require("./zones");
+
+class MatchEngine {
+  constructor(home, away, seed = null) {
+    this.rng = new Rng(seed === null ? undefined : seed);
+    this.home = home;
+    this.away = away;
+
+    this.minute = 0;
+    this.second = 0;
+    this.stoppage_time = 0;
+    this.is_half_time = false;
+    this.is_full_time = false;
+    this.halftime_reached = false;
+
+    this.score_home = 0;
+    this.score_away = 0;
+
+    this.ball_zone = "MID_D_C";
+    this.possession = "home";
+    this.ball_carrier = null;
+
+    this.set_piece = null;
+    this.is_transition = false;
+    this.is_scramble = false;
+    this.is_breaking_away = false;
+    this.last_event_follow_up = null;
+    this._scramble_chain = 0;
+    this._collapse_timer = 0;
+
+    this.events = [];
+    this.stats = {
+      home: { shots: 0, shots_on_target: 0, possession: 0, passes: 0, tackles: 0, fouls: 0, corners: 0, saves: 0 },
+      away: { shots: 0, shots_on_target: 0, possession: 0, passes: 0, tackles: 0, fouls: 0, corners: 0, saves: 0 },
+    };
+    this.possession_counter = 0;
+    this.possession_home = 0;
+
+    this._zones_home = null;
+    this._zones_away = null;
+  }
+
+  _getZones(team) {
+    if (team === "home") {
+      if (!this._zones_home) this._zones_home = this.home.getPlayerZones();
+      return this._zones_home;
+    }
+    if (!this._zones_away) this._zones_away = this.away.getPlayerZones();
+    return this._zones_away;
+  }
+
+  _invalidateZones() { this._zones_home = null; this._zones_away = null; }
+  _attTeam() { return this.possession === "home" ? this.home : this.away; }
+  _defTeam() { return this.possession === "home" ? this.away : this.home; }
+  _attZones() { return this._getZones(this.possession); }
+  _defZones() { return this._getZones(this.possession === "home" ? "away" : "home"); }
+
+  _getCarrierPlayer() {
+    if (!this.ball_carrier) return null;
+    return this._attTeam().players[this.ball_carrier] || null;
+  }
+
+  _getOpponentPlayer() {
+    const [pid] = findNearestOpponent(this.ball_zone, this._defZones());
+    if (!pid) return null;
+    return this._defTeam().players[pid] || null;
+  }
+
+  _getGkPlayer(teamId = null) {
+    const t = teamId ? (teamId === "home" ? this.home : this.away) : this._defTeam();
+    for (const p of Object.values(t.players)) {
+      if (p.role === "GK") return p;
+    }
+    return null;
+  }
+
+  initMatch(firstPossession = "home") {
+    this.possession = firstPossession;
+    this._invalidateZones();
+    const attZones = this._attZones();
+    const attTeam = this._attTeam();
+    for (const [pid, [z, role]] of Object.entries(attZones)) {
+      if (role.startsWith("ST_")) {
+        this.ball_carrier = pid;
+        this.ball_zone = z;
+        return;
+      }
+    }
+    const fallbackPid = Object.keys(attTeam.players).pop();
+    this.ball_carrier = fallbackPid;
+    this.ball_zone = (attZones[fallbackPid] || ["MID_D_C", "ST_C"])[0];
+  }
+
+  _advanceTime(min, max) {
+    const sec = this.rng.randint(min, max);
+    this.second += sec;
+    while (this.second >= 60) { this.second -= 60; this.minute += 1; }
+    if (this.minute >= 45 && !this.halftime_reached) {
+      this.halftime_reached = true;
+      this.is_half_time = true;
+    }
+    if (this.minute >= 90) {
+      if (this.stoppage_time === 0) this.stoppage_time = this.rng.randint(2, 5);
+      if (this.minute >= 90 + this.stoppage_time) this.is_full_time = true;
+    }
+  }
+
+  _updateStats(type, success) {
+    const tk = this.possession === "home" ? "home" : "away";
+    this.possession_counter += 1;
+    if (this.possession === "home") this.possession_home += 1;
+
+    if (type === 'pass') this.stats[tk].passes += 1;
+    if (type === 'tackle') this.stats[tk].tackles += 1;
+  }
+
+  _generateEventDescription(situation, actionType, result, playerName, zoneName) {
+    const { type, subType } = situation;
+
+    switch (type) {
+      case 'pass':
+        if (result.successProb > 0.7) {
+          return `[${this.minute}'] ${playerName}在${zoneName}完成精准传球`;
+        } else if (result.successProb > 0.4) {
+          return `[${this.minute}'] ${playerName}在${zoneName}尝试传球${result.interceptProb > 0.3 ? '被拦截!' : ''}`;
+        } else {
+          return `[${this.minute}'] ${playerName}在${zoneName}传球失误`;
+        }
+
+      case 'dribble':
+        if (result.successRate > 0.7) {
+          return `[${this.minute}'] ${playerName}在${zoneName}成功盘带突破`;
+        } else if (result.successRate > 0.4) {
+          return `[${this.minute}'] ${playerName}在${zoneName}尝试盘带${result.intent?.feint?.isDeceived ? '假动作骗过防守!' : ''}`;
+        } else {
+          return `[${this.minute}'] ${playerName}在${zoneName}盘带被断`;
+        }
+
+      case 'shoot':
+        this.stats[this.possession === "home" ? "home" : "away"].shots += 1;
+        if (result.totalProb > 0.3) {
+          this.stats[this.possession === "home" ? "home" : "away"].shots_on_target += 1;
+          return `[${this.minute}'] ${playerName}在${zoneName}射门! 球进了! ⚽`;
+        } else if (result.onTargetRate > 0.5) {
+          this.stats[this.possession === "home" ? "home" : "away"].shots_on_target += 1;
+          return `[${this.minute}'] ${playerName}在${zoneName}射门! 被门将扑出!`;
+        } else {
+          return `[${this.minute}'] ${playerName}在${zoneName}射门打偏`;
+        }
+
+      case 'tackle':
+        if (result.winProb > 0.6) {
+          this.stats[this.possession === "home" ? "home" : "away"].tackles += 1;
+          return `[${this.minute}'] ${playerName}成功抢断!${result.anticipation?.isCorrect ? '预判准确!' : ''}`;
+        } else if (result.foulProb > 0.3) {
+          this.stats[this.possession === "home" ? "home" : "away"].fouls += 1;
+          return `[${this.minute}'] ${playerName}抢断犯规!`;
+        } else {
+          return `[${this.minute}'] ${playerName}抢断失败`;
+        }
+
+      case 'contest':
+        if (result.winProb > 0.6) {
+          return `[${this.minute}'] ${playerName}争顶成功!`;
+        } else {
+          return `[${this.minute}'] ${playerName}争顶失败`;
+        }
+
+      case 'save':
+        this.stats[this.possession === "home" ? "away" : "home"].saves += 1;
+        if (result.saveProb > 0.5) {
+          return `[${this.minute}'] 门将精彩扑救!${result.anticipation?.isCorrect ? '预判准确!' : ''}`;
+        } else {
+          return `[${this.minute}'] 门将扑救失败`;
+        }
+
+      default:
+        return `[${this.minute}'] ${playerName}在${zoneName}处理球`;
+    }
+  }
+
+  _resolveResult(situation, actionType, result, carrier, opponent, gk) {
+    const { type } = situation;
+    const rng = this.rng.random();
+
+    switch (type) {
+      case 'pass': {
+        const success = rng < result.successProb;
+        this._updateStats('pass', success);
+
+        if (success) {
+          // 传球成功：推进或保持
+          const v = getZoneV(this.ball_zone);
+          const progressMap = { DEEP_D: 'MID_D', MID_D: 'MID_A', MID_A: 'DEEP_A', DEEP_A: 'BOX_A' };
+          if (progressMap[v] && this.rng.random() < 0.6) {
+            this.ball_zone = progressMap[v] + '_C';
+          }
+          return { success: true, desc: '传球成功', followUp: null };
+        } else {
+          // 传球失败：球权转移
+          this.possession = this.possession === "home" ? "away" : "home";
+          this._invalidateZones();
+          this.ball_carrier = null;
+          return { success: false, desc: '传球被断', followUp: null };
+        }
+      }
+
+      case 'dribble': {
+        const success = rng < result.successRate;
+        this._updateStats('dribble', success);
+
+        if (success) {
+          // 盘带成功：推进
+          const v = getZoneV(this.ball_zone);
+          const progressMap = { DEEP_D: 'MID_D', MID_D: 'MID_A', MID_A: 'DEEP_A', DEEP_A: 'BOX_A' };
+          if (progressMap[v]) {
+            this.ball_zone = progressMap[v] + '_C';
+          }
+          return { success: true, desc: '盘带突破', followUp: null };
+        } else {
+          // 盘带失败：球权转移或继续争夺
+          if (this.rng.random() < 0.7) {
+            this.possession = this.possession === "home" ? "away" : "home";
+            this._invalidateZones();
+            this.ball_carrier = null;
+          }
+          return { success: false, desc: '盘带被断', followUp: null };
+        }
+      }
+
+      case 'shoot': {
+        // 射门处理
+        const notBlocked = rng > result.blockRate;
+        if (!notBlocked) {
+          // 被阻挡
+          return { success: false, desc: '射门被阻挡', followUp: 'blocked' };
+        }
+
+        const onTarget = this.rng.random() < result.onTargetRate;
+        if (!onTarget) {
+          this.stats[this.possession === "home" ? "home" : "away"].shots += 1;
+          return { success: false, desc: '射门偏出', followUp: 'goal_kick' };
+        }
+
+        this.stats[this.possession === "home" ? "home" : "away"].shots += 1;
+        this.stats[this.possession === "home" ? "home" : "away"].shots_on_target += 1;
+
+        // 射正，门将扑救
+        const gkResult = executeAction('save', 'save', gk.attrs, {
+          ...situation.context,
+          shotDirection: result.shotDirection || 'center',
+          shotDistance: situation.context.distance,
+          shotPower: 0.7,
+          shotHeight: 0.3
+        });
+
+        const saved = this.rng.random() < gkResult.saveProb;
+        if (saved) {
+          this.stats[this.possession === "home" ? "away" : "home"].saves += 1;
+          return { success: true, desc: '射正被扑', followUp: 'shot_saved' };
+        }
+
+        // 进球！
+        if (this.possession === "home") {
+          this.score_home += 1;
+        } else {
+          this.score_away += 1;
+        }
+        return { success: true, desc: 'GOAL!', followUp: 'goal' };
+      }
+
+      case 'tackle': {
+        const success = rng < result.winProb;
+        this._updateStats('tackle', success);
+
+        if (result.foulProb > 0.3 && this.rng.random() < result.foulProb) {
+          this.stats[this.possession === "home" ? "home" : "away"].fouls += 1;
+          return { success: false, desc: '犯规', followUp: 'foul' };
+        }
+
+        if (success) {
+          // 抢断成功：获得球权
+          return { success: true, desc: '抢断成功', followUp: null };
+        } else {
+          return { success: false, desc: '抢断失败', followUp: null };
+        }
+      }
+
+      case 'contest': {
+        const success = rng < result.winProb;
+
+        if (success) {
+          return { success: true, desc: '争顶成功', followUp: null };
+        } else {
+          // 争顶失败：球权转移
+          this.possession = this.possession === "home" ? "away" : "home";
+          this._invalidateZones();
+          this.ball_carrier = null;
+          return { success: false, desc: '争顶失败', followUp: null };
+        }
+      }
+
+      default:
+        return { success: false, desc: '未知动作', followUp: null };
+    }
+  }
+
+  step() {
+    if (this.is_full_time) return null;
+
+    // 确保有持球者
+    if (this.ball_carrier === null) {
+      const attZ = this._attZones();
+      const k = Object.keys(attZ);
+      if (k.length > 0) {
+        this.ball_carrier = k[0];
+        this.ball_zone = attZ[k[0]][0];
+      } else return null;
+    }
+
+    let carrier = this._getCarrierPlayer();
+    if (!carrier) {
+      const att = this._attTeam();
+      const k = Object.keys(att.players);
+      if (k.length === 0) return null;
+      this.ball_carrier = k[0];
+      carrier = att.players[k[0]];
+      if (!carrier) return null;
+    }
+
+    // 处理后续事件
+    const followUp = this.last_event_follow_up;
+    this.last_event_follow_up = null;
+
+    if (followUp === "goal") {
+      this._advanceTime(30, 45);
+      return {
+        type: "goal",
+        desc: `⚽ GOAL! ${this.possession === "home" ? this.home.name : this.away.name} 进球! 比分 ${this.score_home}-${this.score_away}`,
+        minute: this.minute
+      };
+    }
+
+    // 构建比赛上下文
+    const matchContext = {
+      is_transition: this.is_transition,
+      is_scramble: this.is_scramble,
+      is_breaking_away: this.is_breaking_away,
+      fatigue: carrier.fatigue || 0,
+      setPiece: this.set_piece
+    };
+
+    // 1. 情境判断
+    const situation = determineSituation(
+      this.rng, this.ball_zone, carrier.role, this.possession,
+      this._defZones(), this._attTeam().tactics, this.set_piece, matchContext,
+      this._defTeam().tactics
+    );
+
+    // 2. 动作选择
+    const actionType = selectAction(this.rng, situation, this._attTeam().tactics, carrier.attrs);
+
+    // 3. 获取对手和门将
+    const opponent = this._getOpponentPlayer();
+    const gk = this._getGkPlayer();
+
+    // 4. 执行动作
+    const result = executeAction(
+      situation.type, actionType, carrier.attrs, situation.context,
+      opponent ? opponent.attrs : null, gk ? gk.attrs : null
+    );
+
+    // 5. 处理结果
+    const resolution = this._resolveResult(situation, actionType, result, carrier, opponent, gk);
+
+    // 6. 生成事件描述
+    const zoneName = this.ball_zone;
+    const desc = this._generateEventDescription(situation, actionType, result, carrier.role_name || '球员', zoneName);
+
+    // 7. 时间推进
+    const timeCost = { pass: [8, 15], dribble: [10, 18], shoot: [5, 12], tackle: [8, 15], contest: [10, 18], save: [3, 8] };
+    const [tmin, tmax] = timeCost[situation.type] || [10, 15];
+    this._advanceTime(tmin, tmax);
+
+    // 8. 更新后续事件
+    if (resolution.followUp) {
+      this.last_event_follow_up = resolution.followUp;
+    }
+
+    // 9. 重置状态
+    this.is_transition = false;
+    this.is_scramble = false;
+    this.set_piece = null;
+
+    const event = {
+      type: situation.type,
+      subType: situation.subType,
+      action: actionType,
+      desc,
+      success: resolution.success,
+      minute: this.minute,
+      team: this.possession,
+      zone: this.ball_zone,
+      carrier_pid: this.ball_carrier,
+      carrier_side: this.possession,
+      result: {
+        successProb: result.successProb || result.successRate || result.winProb || result.saveProb,
+        intent: result.intent || result.anticipation || null
+      }
+    };
+
+    this.events.push(event);
+    return event;
+  }
+
+  runMatch({ maxActions = 400, verbose = false } = {}) {
+    this.initMatch();
+    let n = 0;
+    while (!this.is_full_time && n < maxActions) {
+      const r = this.step();
+      if (r && verbose && r.desc) console.log(r.desc);
+      n++;
+    }
+    return this.matchSummary();
+  }
+
+  matchSummary() {
+    const h = this.stats.home, a = this.stats.away;
+    return {
+      score: `${this.score_home}-${this.score_away}`,
+      home: this.home.name,
+      away: this.away.name,
+      shots: `${h.shots}-${a.shots}`,
+      shots_on_target: `${h.shots_on_target}-${a.shots_on_target}`,
+      possession_home_pct: 100 * this.possession_home / Math.max(1, this.possession_counter),
+      passes: `${h.passes}-${a.passes}`,
+      tackles: `${h.tackles}-${a.tackles}`,
+      fouls: `${h.fouls}-${a.fouls}`,
+      corners: `${h.corners}-${a.corners}`,
+      saves: `${h.saves}-${a.saves}`,
+      events: this.events,
+      minute: this.minute,
+      home_positions: this.home.getPositionSnapshot(),
+      away_positions: this.away.getPositionSnapshot({ mirror: true }),
+    };
+  }
+}
+
+module.exports = { MatchEngine };

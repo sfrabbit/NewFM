@@ -1,0 +1,712 @@
+// Match engine main loop. Mirrors match_engine_v2_1.py §7.
+const { ACTIONS, getAction } = require("./actions");
+const { ZONES, getZoneV } = require("./zones");
+const { Rng } = require("./rng");
+const { weightedScore, calcProb } = require("./prob");
+const { findNearestOpponent } = require("./teams");
+const { determineSituation, selectAction } = require("./situations");
+const { resolveBallTransition } = require("./transitions");
+
+class MatchEngine {
+  constructor(home, away, seed = null) {
+    this.rng = new Rng(seed === null ? undefined : seed);
+    this.home = home;
+    this.away = away;
+
+    this.minute = 0;
+    this.second = 0;
+    this.stoppage_time = 0;
+    this.is_half_time = false;
+    this.is_full_time = false;
+    this.halftime_reached = false;
+
+    this.score_home = 0;
+    this.score_away = 0;
+
+    this.ball_zone = "MID_D_C";
+    this.possession = "home";
+    this.ball_carrier = null;
+
+    this.set_piece = null;
+    this.is_transition = false;
+    this.is_scramble = false;
+    this.is_breaking_away = false;
+    this.last_event_follow_up = null;
+    this._scramble_chain = 0;
+    this._collapse_timer = 0;
+
+    this.events = [];
+    this.stats = {
+      home: { shots:0, shots_on_target:0, possession:0, passes:0, tackles:0, fouls:0, corners:0 },
+      away: { shots:0, shots_on_target:0, possession:0, passes:0, tackles:0, fouls:0, corners:0 },
+    };
+    this.possession_counter = 0;
+    this.possession_home = 0;
+
+    this._zones_home = null;
+    this._zones_away = null;
+  }
+
+  _getZones(team) {
+    if (team === "home") {
+      if (!this._zones_home) this._zones_home = this.home.getPlayerZones();
+      return this._zones_home;
+    }
+    if (!this._zones_away) this._zones_away = this.away.getPlayerZones();
+    return this._zones_away;
+  }
+
+  _invalidateZones() { this._zones_home = null; this._zones_away = null; }
+  _attTeam() { return this.possession === "home" ? this.home : this.away; }
+  _defTeam() { return this.possession === "home" ? this.away : this.home; }
+  _attZones() { return this._getZones(this.possession); }
+  _defZones() { return this._getZones(this.possession === "home" ? "away" : "home"); }
+
+  _getCarrierPlayer() {
+    if (!this.ball_carrier) return null;
+    return this._attTeam().players[this.ball_carrier] || null;
+  }
+
+  _getOpponentPlayer() {
+    const [pid] = findNearestOpponent(this.ball_zone, this._defZones());
+    if (!pid) return null;
+    return this._defTeam().players[pid] || null;
+  }
+
+  _getGkPlayer(teamId = null) {
+    const t = teamId ? (teamId === "home" ? this.home : this.away) : this._defTeam();
+    for (const p of Object.values(t.players)) {
+      if (p.role === "GK") return p;
+    }
+    return null;
+  }
+
+  initMatch(firstPossession = "home") {
+    this.possession = firstPossession;
+    this._invalidateZones();
+    const attZones = this._attZones();
+    const attTeam = this._attTeam();
+    for (const [pid, [z, role]] of Object.entries(attZones)) {
+      if (role.startsWith("ST_")) {
+        this.ball_carrier = pid;
+        this.ball_zone = z;
+        return;
+      }
+    }
+    const fallbackPid = Object.keys(attTeam.players).pop();
+    this.ball_carrier = fallbackPid;
+    this.ball_zone = (attZones[fallbackPid] || ["MID_D_C", "ST_C"])[0];
+  }
+
+  // ── mental modifiers ──
+  _getPressureFactor(player) {
+    const conf = player ? (player.attrs["自信"] ?? 10) : 10;
+    return 0.85 + conf * 0.0075;
+  }
+
+  _checkPositionalError(player) {
+    const disc = player ? (player.attrs["纪律性"] ?? 10) : 10;
+    const team = player ? (player.attrs["团队导向"] ?? 10) : 10;
+    const score = disc * 0.6 + team * 0.4;
+    const p = 0.05 + Math.max(0, 20 - score) * 0.007;
+    return this.rng.random() < p;
+  }
+
+  _checkFoulRisk(player, pressing = 0) {
+    const disc = player ? (player.attrs["纪律性"] ?? 10) : 10;
+    let p = 0.03 + Math.max(0, 20 - disc) * 0.009;
+    // High pressing → more committed challenges → higher foul rate when tackle lands.
+    p *= 1 + Math.max(-2, Math.min(2, pressing)) * 0.20;
+    return this.rng.random() < Math.max(0, p);
+  }
+
+  _buildMentalMods(myPlayer, oppPlayer, ftype) {
+    // Note: Python's mental_mods are computed but only my_pressure is used as my_factor.
+    // We return { my_factor, opp_factor } compatible with prob.js calcProb.
+    let myFactor = 1.0, oppFactor = 1.0;
+    if (oppPlayer) myFactor *= this._getPressureFactor(myPlayer);
+
+    // Concentration decay on defender
+    const defC = oppPlayer ? (oppPlayer.attrs["集中力"] ?? 10) : 10;
+    const m = this.minute;
+    let decay = 1.0;
+    if (m <= 15)        decay = 1.0;
+    else if (m <= 30)   decay = 1.0 + (20 - defC) * 0.005;
+    else if (m <= 45)   decay = 1.0 + (20 - defC) * 0.010;
+    else if (m <= 60)   decay = 1.0 + (20 - defC) * 0.008;
+    else if (m <= 75)   decay = 1.0 + (20 - defC) * 0.015;
+    else                decay = 1.0 + (20 - defC) * 0.020;
+    // Defender suffers, so attacker effectively gets larger my_score relative to opp.
+    // We map this onto opp_factor reduction (multiplicative inverse of decay).
+    if (decay > 0) oppFactor *= 1 / decay;
+
+    if (this._collapse_timer > 0) {
+      myFactor *= 0.80;
+      oppFactor *= 1.15;
+    }
+    return { my_factor: myFactor, opp_factor: oppFactor };
+  }
+
+  // ── time ──
+  _timeCost(sid) {
+    const t = {
+      S01:[12,22],S02:[14,24],S03:[10,18],S04:[12,22],S05:[14,24],
+      S06:[16,28],S07:[10,18],S08:[10,18],S09:[14,24],S10:[14,22],
+      S11:[14,22],S12:[10,18],S13:[14,24],S14:[30,40],S15:[8,16],
+      S16:[8,16],S17:[12,20],S18:[8,16],S20:[16,28],
+      S21:[30,40],S22:[30,40],S23:[14,24],
+    };
+    return t[sid] || [10, 16];
+  }
+
+  _advanceTime(min, max) {
+    const sec = this.rng.randint(min, max);
+    this.second += sec;
+    while (this.second >= 60) { this.second -= 60; this.minute += 1; }
+    if (this.minute >= 45 && !this.halftime_reached) {
+      this.halftime_reached = true;
+      this.is_half_time = true;
+    }
+    if (this.minute >= 90) {
+      if (this.stoppage_time === 0) this.stoppage_time = this.rng.randint(2, 5);
+      if (this.minute >= 90 + this.stoppage_time) this.is_full_time = true;
+    }
+  }
+
+  _updateStats(sid, aid, success, followUp) {
+    const tk = this.possession === "home" ? "home" : "away";
+    this.possession_counter += 1;
+    if (this.possession === "home") this.possession_home += 1;
+    if (["S01","S02","S03","S04","S05","S06","S07","S08","S09"].includes(sid)) {
+      this.stats[tk].passes += 1;
+    }
+    if (["S10","S11","S13","S14"].includes(sid)) {
+      this.stats[tk].shots += 1;
+      if (["goal","shot_on_target","shot_saved"].includes(followUp)) {
+        this.stats[tk].shots_on_target += 1;
+      }
+    }
+    if (["S15","S16","S17","S18"].includes(sid)) {
+      this.stats[tk].tackles += 1;
+    }
+  }
+
+  // ── handlers ──
+  _handleGoal() {
+    const scoringTeam = this.possession;
+    if (scoringTeam === "home") { this.score_home += 1; this.possession = "away"; }
+    else                        { this.score_away += 1; this.possession = "home"; }
+
+    const lost = this.possession === "home" ? this.home : this.away;
+    const composureVals = Object.values(lost.players).map(p => p.attrs["情绪稳定性"] ?? 10);
+    const minC = composureVals.length ? Math.min(...composureVals) : 10;
+    const collapseProb = Math.max(0, (20 - minC) * 0.04 - 0.1);
+    if (this.rng.random() < collapseProb) {
+      this._collapse_timer = Math.floor(5 + (20 - minC) * 0.5);
+    }
+
+    this.ball_zone = "MID_D_C";
+    this._invalidateZones();
+    this.set_piece = null;
+    this.is_transition = false;
+    this.last_event_follow_up = null;
+    const scorerName = scoringTeam === "home" ? this.home.name : this.away.name;
+    const attZ = this._attZones();
+    for (const [pid, [z, role]] of Object.entries(attZ)) {
+      if (role.startsWith("ST_")) { this.ball_carrier = pid; this.ball_zone = z; break; }
+    }
+    return { type: "goal", desc: `⚽ GOAL! ${scorerName} 进球! 比分 ${this.score_home}-${this.score_away}` };
+  }
+
+  _handleShotSaved() {
+    if (this.rng.random() < 0.4) {
+      this.last_event_follow_up = "corner";
+    } else {
+      for (const [pid, [z, role]] of Object.entries(this._defZones())) {
+        if (role === "GK") {
+          this.possession = this.possession === "home" ? "away" : "home";
+          this.ball_carrier = pid;
+          this.ball_zone = z;
+          this.last_event_follow_up = null;
+          return null;
+        }
+      }
+    }
+    return null;
+  }
+
+  _handleShotMiss() { this.last_event_follow_up = "goal_kick"; return null; }
+
+  _handleShotOnTarget() {
+    const gk = this._getGkPlayer();
+    if (gk) {
+      const gkScore = weightedScore(gk.attrs, "力量输出(0.6)+触球精度(0.4)");
+      const attPlayer = this._getCarrierPlayer();
+      let shotQuality = attPlayer
+        ? weightedScore(attPlayer.attrs, "触球精度(0.5)+力量输出(0.5)")
+        : 12;
+      const conf = attPlayer ? this._getPressureFactor(attPlayer) : 1.0;
+      shotQuality *= conf;
+      if (this._collapse_timer > 0) shotQuality *= 0.85;
+      const wSave = this.is_scramble ? 0.45 : 0.55;
+      this.is_scramble = false;
+      this._scramble_chain = 0;
+      const pSave = gkScore / Math.max(gkScore + wSave * shotQuality, 0.01);
+      this.last_event_follow_up = this.rng.random() < pSave ? "shot_saved" : "goal";
+      return null;
+    }
+    this.last_event_follow_up = "goal";
+    return null;
+  }
+
+  _handleSetPiece(pieceType) {
+    this.set_piece = pieceType;
+    if (pieceType === "corner") {
+      const tk = this.possession === "home" ? "home" : "away";
+      this.stats[tk].corners += 1;
+      this.ball_zone = "BOX_A_C";
+    }
+    return null;
+  }
+
+  _handleGoalKick() {
+    for (const [pid, [z, role]] of Object.entries(this._defZones())) {
+      if (role === "GK") {
+        this.possession = this.possession === "home" ? "away" : "home";
+        this.ball_carrier = pid;
+        this.ball_zone = z;
+        this.set_piece = null;
+        return null;
+      }
+    }
+    return null;
+  }
+
+  _handleCrossArrives() {
+    if (this.rng.random() < 0.50) {
+      for (const [pid, [z, role]] of Object.entries(this._defZones())) {
+        if (getZoneV(z) === "BOX_A" && ["CB_L","CB_R","GK"].includes(role)) {
+          this.possession = this.possession === "home" ? "away" : "home";
+          this.ball_carrier = pid;
+          this.ball_zone = z;
+          this._invalidateZones();
+          this.last_event_follow_up = null;
+          this._advanceTime(3, 8);
+          return { sid:"S12", aid:"X1", desc:`[${this.minute}'] 传中! 被防守球员解围`, success:false, minute:this.minute };
+        }
+      }
+      this.last_event_follow_up = "goal_kick";
+      this._advanceTime(3, 8);
+      return { sid:"S12", aid:"X1", desc:`[${this.minute}'] 传中! 被门将没收`, success:false, minute:this.minute };
+    }
+    const aid = selectAction(this.rng, "S12", this._attTeam().tactics);
+    return this._executeAction("S12", aid, this._getCarrierPlayer());
+  }
+
+  _handleThroughBallArrives() {
+    if (this.rng.random() < 0.45) {
+      for (const [pid, [z, role]] of Object.entries(this._defZones())) {
+        if (role === "GK") {
+          this.possession = this.possession === "home" ? "away" : "home";
+          this.ball_carrier = pid;
+          this.ball_zone = z;
+          this._invalidateZones();
+          this.last_event_follow_up = null;
+          this._advanceTime(3, 8);
+          return { sid:"S11", aid:"X1", desc:`[${this.minute}'] 直塞! 门将出击没收`, success:false, minute:this.minute };
+        }
+      }
+      const [pid] = this._defTeam().findNearestTeammate("BOX_A_C", this._defZones());
+      if (pid) {
+        this.possession = this.possession === "home" ? "away" : "home";
+        this.ball_carrier = pid;
+        this.ball_zone = this._defZones()[pid][0];
+        // re-fetch because possession swapped
+        this._invalidateZones();
+        this.last_event_follow_up = null;
+        this._advanceTime(3, 8);
+        return { sid:"S11", aid:"X1", desc:`[${this.minute}'] 直塞! 被后卫破坏`, success:false, minute:this.minute };
+      }
+      this._advanceTime(3, 8);
+      return null;
+    }
+    const aid = selectAction(this.rng, "S11", this._attTeam().tactics);
+    return this._executeAction("S11", aid, this._getCarrierPlayer());
+  }
+
+  // ── two-phase shot ──
+  _simulateTwoPhase(actionDef, myPlayer, oppPlayer, gkPlayer) {
+    const w = actionDef[6];
+    const wSave = actionDef.length > 7 ? actionDef[7] : 0.50;
+    const myScore = weightedScore(myPlayer.attrs, actionDef[3]);
+    let oppScore = oppPlayer ? weightedScore(oppPlayer.attrs, actionDef[4]) : 12;
+    if (oppScore <= 0) oppScore = 12;
+    const pSot = myScore / (myScore + w * oppScore);
+    if (this.rng.random() >= pSot) {
+      this.last_event_follow_up = "shot_miss";
+      return false;
+    }
+    const gkScore = gkPlayer
+      ? weightedScore(gkPlayer.attrs, "力量输出(0.6)+触球精度(0.4)")
+      : 14;
+    let confFactor = this._getPressureFactor(myPlayer);
+    if (["star","legend"].includes(myPlayer.quality) && (myPlayer.attrs["自信"] ?? 10) < 16) {
+      confFactor *= 0.88;
+    }
+    let shotQuality = myScore * confFactor;
+    if (this._collapse_timer > 0) shotQuality *= 0.85;
+    const pSave = gkScore / (gkScore + wSave * shotQuality);
+    if (this.rng.random() < pSave) {
+      this.last_event_follow_up = "shot_saved";
+      return false;
+    }
+    this.last_event_follow_up = "goal";
+    return true;
+  }
+
+  // ── action exec ──
+  _executeAction(sid, aid, carrierPlayer) {
+    const oppPlayer = this._getOpponentPlayer();
+    const gk = this._getGkPlayer();
+    const actionDef = getAction(sid, aid);
+    let success = false;
+    let followUp = null;
+
+    if (!actionDef) {
+      success = this.rng.random() < 0.5;
+    } else {
+      const ftype = actionDef[5];
+      if (ftype === "两段_射正_扑救") {
+        const gkOpp = gk || oppPlayer;
+        success = this._simulateTwoPhase(actionDef, carrierPlayer, gkOpp, gk);
+        followUp = this.last_event_follow_up;
+        this._updateStats(sid, aid, success, followUp);
+        const [tmin, tmax] = this._timeCost(sid);
+        this._advanceTime(tmin, tmax);
+
+        if (followUp === "goal") {
+          const scoring = this.possession;
+          if (scoring === "home") this.score_home += 1; else this.score_away += 1;
+          const sn = scoring === "home" ? this.home.name : this.away.name;
+          this.ball_zone = "MID_D_C";
+          this.possession = scoring === "home" ? "away" : "home";
+          this._invalidateZones();
+          this.set_piece = null;
+          this.is_transition = false;
+          this.last_event_follow_up = null;
+          const attZ = this._attZones();
+          for (const [pid, [z, role]] of Object.entries(attZ)) {
+            if (role.startsWith("ST_")) { this.ball_carrier = pid; this.ball_zone = z; break; }
+          }
+          return { sid, aid, desc:`[${this.minute}'] ${carrierPlayer.role_name}${actionDef[2]} → ⚽ GOAL! ${sn} 进球! 比分 ${this.score_home}-${this.score_away}`, success:true, minute:this.minute };
+        }
+        if (followUp === "shot_saved") {
+          return { sid, aid, desc:`[${this.minute}'] ${carrierPlayer.role_name}${actionDef[2]} → 射正! 门将扑出!`, success:true, minute:this.minute };
+        }
+        return { sid, aid, desc:`[${this.minute}'] ${carrierPlayer.role_name}${actionDef[2]} → 打偏了`, success:false, minute:this.minute };
+      }
+
+      if (ftype === "两段_射正") {
+        const mods = this._buildMentalMods(carrierPlayer, oppPlayer, ftype);
+        const p = calcProb(carrierPlayer.attrs, oppPlayer ? oppPlayer.attrs : {}, actionDef, mods);
+        if (this.rng.random() < p) { followUp = "shot_on_target"; success = true; }
+        else                        { followUp = "shot_miss";     success = false; }
+        this._updateStats(sid, aid, success, followUp);
+        this.last_event_follow_up = followUp;
+        const [tmin, tmax] = this._timeCost(sid);
+        this._advanceTime(tmin, tmax);
+        return success
+          ? { sid, aid, desc:`[${this.minute}'] ${carrierPlayer.role_name}${actionDef[2]} → 射正!`, success:true, minute:this.minute }
+          : { sid, aid, desc:`[${this.minute}'] ${carrierPlayer.role_name}${actionDef[2]} → 打偏了`, success:false, minute:this.minute };
+      }
+
+      // 扑救 / 纯己方 / 对抗
+      const mods = this._buildMentalMods(carrierPlayer, oppPlayer, ftype);
+      const p = calcProb(carrierPlayer.attrs, oppPlayer ? oppPlayer.attrs : {}, actionDef, mods);
+      success = this.rng.random() < p;
+    }
+
+    // 非射击动作 → 正常球权转移
+    if (!actionDef || !["两段_射正_扑救","两段_射正"].includes(actionDef[5])) {
+      const [newZone, newTeam, newCarrier, fup, posChg] = resolveBallTransition(
+        this.rng, sid, aid, success, this.ball_zone, this.possession, this.ball_carrier,
+        this.home, this.away, this._attZones(), this._defZones()
+      );
+      this.ball_zone = newZone;
+      if (posChg) { this.possession = newTeam; this._invalidateZones(); }
+      this.ball_carrier = newCarrier;
+      this.last_event_follow_up = fup;
+      this.set_piece = null;
+      this.is_transition = false;
+      if (sid === "S13") {
+        if (this._scramble_chain >= 2) {
+          this.is_scramble = false;
+          this._scramble_chain = 0;
+          this.ball_zone = "MID_D_C";
+          this.possession = this.possession === "home" ? "away" : "home";
+          this.ball_carrier = null;
+          this._invalidateZones();
+        }
+      } else {
+        this.is_scramble = false;
+        this._scramble_chain = 0;
+      }
+      this.is_breaking_away = false;
+      this._updateStats(sid, aid, success, fup);
+      const [tmin, tmax] = this._timeCost(sid);
+      this._advanceTime(tmin, tmax);
+      followUp = fup;
+    }
+
+    return this._generateCommentary(sid, aid, success, followUp);
+  }
+
+  _handleDefensiveAction(sid /*, ctx*/) {
+    const defTeam = this._defTeam();
+    const defZones = this._defZones();
+    const [defPid] = findNearestOpponent(this.ball_zone, defZones);
+    if (!defPid) return null;
+    let defender = defTeam.players[defPid];
+    if (!defender) return null;
+    const attacker = this._getCarrierPlayer();
+
+    if (sid === "S19") {
+      const gk = this._getGkPlayer(this.possession === "home" ? "away" : "home");
+      if (!gk) return null;
+      defender = gk;
+    }
+
+    const aid = selectAction(this.rng, sid, defTeam.tactics);
+    const actionDef = getAction(sid, aid);
+    let p = 0.5;
+    if (actionDef) {
+      const ftype = actionDef[5];
+      const posError = this._checkPositionalError(defender);
+      const posPenalty = posError ? 0.7 : 1.0;
+      const mods = this._buildMentalMods(defender, attacker, ftype);
+      mods.my_factor = (mods.my_factor || 1.0) * posPenalty;
+      // Pressing intent gives a small commitment bonus on defensive duels.
+      // High pressing = decisive challenge (+10% per step); low = passive
+      // containment (−10% per step). Almost all S15/S16/S17/S18 actions are
+      // duel-type so apply uniformly.
+      const pressing = defTeam.tactics.getPressingMod();
+      const pressingBoost = 1 + Math.max(-2, Math.min(2, pressing)) * 0.10;
+      mods.my_factor *= pressingBoost;
+      p = calcProb(defender.attrs, attacker ? attacker.attrs : {}, actionDef, mods);
+    }
+    const success = this.rng.random() < p;
+
+    if (success && this._checkFoulRisk(defender, defTeam.tactics.getPressingMod())) {
+      const fup = this.rng.random() < 0.6 ? "throw_in" : "corner";
+      this.last_event_follow_up = fup;
+      this.set_piece = null;
+      this.is_transition = false;
+      this.is_scramble = false;
+      this.is_breaking_away = false;
+      this._advanceTime(10, 20);
+      this.possession = this.possession === "home" ? "away" : "home";
+      this._invalidateZones();
+      return { sid, aid, desc:`[${this.minute}'] ${defender.role_name}${actionDef[2]} → 犯规!`, success:false, minute:this.minute };
+    }
+
+    const [newZone, newTeam, newCarrier, fup, posChg] = resolveBallTransition(
+      this.rng, sid, aid, success, this.ball_zone, this.possession, defPid,
+      this.home, this.away, this._attZones(), this._defZones()
+    );
+    this.ball_zone = newZone;
+    if (posChg) { this.possession = newTeam; this._invalidateZones(); }
+    this.ball_carrier = newCarrier;
+    this.last_event_follow_up = fup;
+    this.set_piece = null;
+    this.is_transition = false;
+    this.is_scramble = false;
+    this.is_breaking_away = false;
+    this._updateStats(sid, aid, success, fup);
+    const [tmin, tmax] = this._timeCost(sid);
+    this._advanceTime(tmin, tmax);
+    return this._generateCommentary(sid, aid, success, fup);
+  }
+
+  _generateCommentary(sid, aid, success, followUp) {
+    const actionDef = getAction(sid, aid);
+    const actionName = actionDef ? actionDef[2] : "处理球";
+    const zoneName = (ZONES[this.ball_zone] || {}).name || "";
+    const carrier = this._getCarrierPlayer();
+    const playerName = carrier ? carrier.role_name : "球员";
+
+    let desc;
+    if (sid === "S01" || sid === "S02") {
+      const pres = sid === "S01" ? "受压下" : "";
+      desc = `[${this.minute}'] ${playerName}在${zoneName}${pres}${actionName}`;
+      if (!success) desc += " → 被断!";
+    } else if (sid === "S03") {
+      desc = `[${this.minute}'] ${playerName}在${zoneName}接球, ${actionName}`;
+      if (!success) desc += " → 丢球!";
+    } else if (["S04","S05","S06","S07"].includes(sid)) {
+      desc = `[${this.minute}'] ${playerName}在${zoneName}${actionName}`;
+      if (success) {
+        if (aid === "A4" && sid === "S07") desc += " → 直塞身后!";
+        else if (aid === "A1" && sid === "S06") desc += " → 传中!";
+      } else desc += " → 被拦截";
+    } else if (sid === "S08") {
+      desc = `[${this.minute}'] ${playerName}在前场${actionName}`;
+    } else if (sid === "S09") {
+      desc = `[${this.minute}'] 反击! ${playerName}${actionName}`;
+      if (success) desc += " → 快速推进!";
+    } else if (sid === "S10" || sid === "S11") {
+      desc = `[${this.minute}'] ${playerName}在${zoneName}${actionName}!`;
+      desc += success ? " → 射正!" : " → 打偏了";
+    } else if (sid === "S12") {
+      desc = `[${this.minute}'] 传中抢点! ${playerName}${actionName}`;
+    } else if (sid === "S13") {
+      desc = `[${this.minute}'] 禁区混战! ${playerName}${actionName}`;
+    } else if (sid === "S14") {
+      desc = `[${this.minute}'] 点球! ${playerName}${actionName}`;
+      desc += success ? " → 🥅进球!" : " → 扑出!";
+    } else if (["S15","S16","S17","S18"].includes(sid)) {
+      desc = `[${this.minute}'] ${playerName}${actionName}`;
+      desc += success ? " → 抢断成功!" : " → 被过";
+    } else if (sid === "S19" || sid === "S20") {
+      desc = `[${this.minute}'] 门将${actionName}`;
+    } else if (["S21","S22","S23"].includes(sid)) {
+      desc = `[${this.minute}'] 定位球: ${playerName}${actionName}`;
+    } else {
+      desc = `[${this.minute}'] ${playerName}${actionName}`;
+    }
+
+    if (!["S10","S11","S12","S13","S14"].includes(sid)) {
+      if (followUp === "shot_saved") desc += " → 门将扑出!";
+      else if (followUp === "shot_miss") desc += " → 打偏了";
+    }
+    return { sid, aid, desc, success, minute: this.minute };
+  }
+
+  step() {
+    if (this.is_full_time) return null;
+
+    if (this.ball_carrier === null) {
+      const attZ = this._attZones();
+      const k = Object.keys(attZ);
+      if (k.length > 0) {
+        this.ball_carrier = k[0];
+        this.ball_zone = attZ[k[0]][0];
+      } else return null;
+    }
+
+    let carrier = this._getCarrierPlayer();
+    if (!carrier) {
+      const att = this._attTeam();
+      const k = Object.keys(att.players);
+      if (k.length === 0) return null;
+      this.ball_carrier = k[0];
+      carrier = att.players[k[0]];
+      if (!carrier) return null;
+    }
+
+    const followUp = this.last_event_follow_up;
+    this.last_event_follow_up = null;
+
+    if (followUp === "goal") {
+      const r = this._handleGoal();
+      this._advanceTime(30, 45);
+      return r;
+    }
+    if (followUp === "shot_saved")  { const r = this._handleShotSaved(); this._advanceTime(5, 10); return r; }
+    if (followUp === "shot_miss")   { const r = this._handleShotMiss();  this._advanceTime(5, 10); return r; }
+    if (followUp === "shot_on_target") { const r = this._handleShotOnTarget(); this._advanceTime(2, 5); return r; }
+    if (followUp === "corner")      { const r = this._handleSetPiece("corner");   this._advanceTime(15, 25); return r; }
+    if (followUp === "throw_in")    { const r = this._handleSetPiece("throw_in"); this._advanceTime(8, 15);  return r; }
+    if (followUp === "goal_kick")   { const r = this._handleGoalKick();           this._advanceTime(10, 15); return r; }
+    if (followUp === "cross_arrives")        return this._handleCrossArrives();
+    if (followUp === "through_ball_arrives") return this._handleThroughBallArrives();
+
+    const matchContext = {
+      is_transition: this.is_transition,
+      is_scramble: this.is_scramble,
+      is_breaking_away: this.is_breaking_away,
+    };
+
+    const [sid] = determineSituation(
+      this.rng, this.ball_zone, carrier.role, this.possession,
+      this._defZones(), this._attTeam().tactics, this.set_piece, matchContext,
+      this._defTeam().tactics  // defender's pressing drives pressure level
+    );
+
+    if (sid === "S13") { this.is_scramble = true; this._scramble_chain += 1; }
+
+    if (["S15","S16","S17","S18","S19"].includes(sid)) {
+      return this._handleDefensiveAction(sid);
+    }
+
+    const aid = selectAction(this.rng, sid, this._attTeam().tactics);
+    return this._executeAction(sid, aid, carrier);
+  }
+
+  runMatch({ maxActions = 400, verbose = false } = {}) {
+    this.initMatch();
+    let n = 0;
+    while (!this.is_full_time && n < maxActions) {
+      const possBefore = this.possession;
+      const scoreHBefore = this.score_home;
+      const scoreABefore = this.score_away;
+      const r = this.step();
+      if (r) {
+        // Enrich event with team + tags for the front-end
+        const desc = r.desc || "";
+        let team = possBefore;
+        // Defensive actions: actor is the opposing team
+        if (r.sid && ["S15","S16","S17","S18","S19"].includes(r.sid)) {
+          team = possBefore === "home" ? "away" : "home";
+        }
+        // Goals: detect scorer by which score went up
+        const goalH = this.score_home > scoreHBefore;
+        const goalA = this.score_away > scoreABefore;
+        if (goalH || goalA) team = goalH ? "home" : "away";
+        r.team = team;
+        // Tag categorization for live stats
+        const tags = [];
+        if (goalH || goalA) tags.push("goal");
+        if (/射正|射门|打偏|🥅进球|GOAL/.test(desc)) tags.push("shot");
+        if (/射正|🥅进球|GOAL/.test(desc)) tags.push("shot_on_target");
+        if (/抢断成功/.test(desc)) tags.push("tackle");
+        if (/犯规/.test(desc)) tags.push("foul");
+        // Corners: sid S22 = corner kick. Also tolerate "角球" in desc as fallback.
+        if (r.sid === "S22" || /角球/.test(desc)) tags.push("corner");
+        // Defensive duels (S15/S16/S17/S18): the success outcome IS a tackle won.
+        if (["S15","S16","S17","S18"].includes(r.sid) && r.success && !tags.includes("tackle")) tags.push("tackle");
+        if (/传球|接球|传中|直塞/.test(desc) && !tags.includes("shot")) tags.push("pass");
+        r.tags = tags;
+        // Attach current ball zone for the in-match event pitch
+        r.zone = this.ball_zone || null;
+        // Step-3 prototype: who has the ball after this event, so the front-end
+        // can move that specific dot toward the new zone.
+        r.carrier_pid = this.ball_carrier || null;
+        r.carrier_side = this.possession || null;
+        this.events.push(r);
+        if (verbose && r.desc) console.log(r.desc);
+      }
+      n++;
+    }
+    return this.matchSummary();
+  }
+
+  matchSummary() {
+    const h = this.stats.home, a = this.stats.away;
+    return {
+      score: `${this.score_home}-${this.score_away}`,
+      home: this.home.name,
+      away: this.away.name,
+      shots: `${h.shots}-${a.shots}`,
+      shots_on_target: `${h.shots_on_target}-${a.shots_on_target}`,
+      possession_home_pct: 100 * this.possession_home / Math.max(1, this.possession_counter),
+      events: this.events,
+      minute: this.minute,
+      // Dumb-prototype Step 1+2: static position snapshot at match start
+      // (taken now from current tactics; for the prototype it doesn't move).
+      home_positions: this.home.getPositionSnapshot(),
+      away_positions: this.away.getPositionSnapshot({ mirror: true }),
+    };
+  }
+}
+
+module.exports = { MatchEngine };

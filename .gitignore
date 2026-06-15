@@ -1,0 +1,12 @@
+node_modules/
+__pycache__/
+*.pyc
+user_code/
+_chk*.py
+_patch*.py
+_replace*.py
+_test*.py
+_t2*.py
+_squad*.py
+*_players_data.json
+package-lock.json
