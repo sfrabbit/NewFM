@@ -25,6 +25,8 @@
 - **涉及文件**：`situations.js` → `determineSituation` + `match.js` → `_playerCoords`
 - **N 取值**：需研究（1m或0.5m）
 
-## selectAction 子类型权重精简
-- 传球/盘带/射门子类型选择的权重公式中大量拍脑袋系数
-- 待精简为核心属性驱动的2-3项
+## selectAction 子类型权重精简 ✅ 已完成
+- **传球**：离散 4 种类型 → 连续 riskLevel(0-1)，属性+情境决定，pass.js 参数连续插值
+- **盘带**：5 种离散 weights(21 个魔数) → 连续 dribbleStyle(0-1)，属性+情境决定
+- **射门**：4 种离散 weights(26 个魔数) → 高空球物理强制(凌空/头球)，地面球连续 shootStyle(0-1)
+- 删除了 `weightedRandom` 工具函数
