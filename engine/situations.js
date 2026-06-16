@@ -85,24 +85,39 @@ function shootUtility(xgValue, personalModifier = 0) {
   return xgValue * Math.exp(personalModifier);
 }
 
-// ── 传球效用 = f(zone, pressure) ──
-function passUtility(v, pressure) {
-  if (v === 'BOX_A')      return 0.18;
-  if (v === 'DEEP_A')     return 0.20 + pressure * 0.05;
-  if (v === 'MID_A')      return 0.25 + pressure * 0.05;
-  if (v === 'MID_D')      return 0.25;
-  if (v === 'DEEP_D')     return 0.20;
-  if (v === 'BOX_D')      return 0.18;
-  return 0.20;
+// ── 传球效用 = f(zone, pressure, passTendency) ──
+// passTendency: 战术预留（默认0，将来可正可负。正=更倾向传球，负=更倾向不传）
+function passUtility(v, pressure, passTendency = 0) {
+  const tacticalMod = Math.exp(passTendency);
+  if (v === 'BOX_A')      return 0.18 * tacticalMod;
+  if (v === 'DEEP_A')     return (0.20 + pressure * 0.05) * tacticalMod;
+  if (v === 'MID_A')      return (0.25 + pressure * 0.05) * tacticalMod;
+  if (v === 'MID_D')      return 0.25 * tacticalMod;
+  if (v === 'DEEP_D')     return 0.20 * tacticalMod;
+  if (v === 'BOX_D')      return 0.18 * tacticalMod;
+  return 0.20 * tacticalMod;
 }
 
-// ── 盘带效用 = f(zone, pressure, xg) ──
-function dribbleUtility(v, pressure, xgValue) {
-  if (v === 'BOX_D' || v === 'DEEP_D') return 0.01;
+// ── 盘带效用 = f(distance→risk, pressure, xg, dribbleTendency) ──
+// 不是按zone分档，而是用离球门距离驱动的连续丢球风险模型：
+//   越靠近对方球门(d小) → 丢球后果轻 → 敢带
+//   越靠近本方球门(d大) → 丢球后果重 → 不敢带
+// dribbleTendency: 战术预留（默认0，将来可正可负）
+function dribbleUtility(v, pressure, xgValue, dribbleTendency = 0) {
+  const distMap = { BOX_A: 8, DEEP_A: 14, MID_A: 22, MID_D: 35, DEEP_D: 45, BOX_D: 55 };
+  const d = distMap[v] || 25;
+
+  // riskFactor: 连续物理量 — 离球门越远，丢球风险成本越高
+  // d=8m(BOX_A)→0.85, d=35m(MID_D)→0.36, d=55m(BOX_D)→0.00(自然归零)
+  const riskFactor = Math.max(0, 1 - d / 55);
+
   const xgBlock = Math.max(0, 1 - xgValue / 0.20);
   const pressBlock = 1 - pressure;
-  const zoneBase = (v === 'MID_D') ? 0.06 : (v === 'MID_A') ? 0.05 : (v === 'DEEP_A') ? 0.04 : 0.03;
-  return zoneBase * xgBlock * pressBlock;
+
+  // baseWillingness: 行为校准常数（单一标量，非zone分档魔数）
+  const baseWillingness = 0.12;
+
+  return baseWillingness * riskFactor * xgBlock * pressBlock * Math.exp(dribbleTendency);
 }
 
 // ── xG 快速估算 ──
@@ -120,10 +135,12 @@ function estimateXG(v, ctx) {
 }
 
 // ── 综合决策 ──
-// shootWillingness: 战术指令预留（默认0，将来可正可负）
+// shootWillingness: 战术预留（默认0，将来可正可负）
+// passTendency:      战术预留（默认0，将来可正可负）
+// dribbleTendency:   战术预留（默认0，将来可正可负）
 // matchMinute: 比赛分钟数（用于时间压力计算）
 // attrs: 球员属性 { 自信, 团队, ... }
-function decisionProbs(ballZone, role, attrs, pressure, tacticPos, xgValue, shootWillingness = 0, matchMinute = 0) {
+function decisionProbs(ballZone, role, attrs, pressure, tacticPos, xgValue, shootWillingness = 0, matchMinute = 0, passTendency = 0, dribbleTendency = 0) {
   const v = getZoneV(ballZone);
   const xg = xgValue !== undefined ? xgValue : 0.1;
 
@@ -139,8 +156,8 @@ function decisionProbs(ballZone, role, attrs, pressure, tacticPos, xgValue, shoo
   const personalModifier = shootWillingness + timePressureBonus + personalityBonus;
 
   const shootU  = shootUtility(xg, personalModifier);
-  const passU   = passUtility(v, pressure);
-  const dribbleU = dribbleUtility(v, pressure, xg);
+  const passU   = passUtility(v, pressure, passTendency);
+  const dribbleU = dribbleUtility(v, pressure, xg, dribbleTendency);
 
   const total = shootU + passU + dribbleU;
   return {
@@ -242,7 +259,7 @@ function determineSituation(rng, ballZone, carrierRole, carrierAttrs, possession
     // 禁区持球：决策
     if (/^(ST_|W_|IF_|AM_)/.test(carrierRole)) {
       const xg = estimateXG(v, ctx);
-      const { pShoot, pPass, pDribble } = decisionProbs(ballZone, carrierRole, carrierAttrs, ctx.pressure, undefined, xg, 0, matchContext.match_minute || 0);
+      const { pShoot, pPass, pDribble } = decisionProbs(ballZone, carrierRole, carrierAttrs, ctx.pressure, undefined, xg, 0, matchContext.match_minute || 0, 0, 0);
       const r = rng.random();
       if (r < pShoot) {
         return { type: 'shoot', subType: 'boxShot', context: ctx };
@@ -277,7 +294,7 @@ function determineSituation(rng, ballZone, carrierRole, carrierAttrs, possession
     }
     if (/^(ST_|W_|IF_|AM_)/.test(carrierRole)) {
       const xg = estimateXG(v, ctx);
-      const { pShoot, pPass, pDribble } = decisionProbs(ballZone, carrierRole, carrierAttrs, ctx.pressure, undefined, xg, 0, matchContext.match_minute || 0);
+      const { pShoot, pPass, pDribble } = decisionProbs(ballZone, carrierRole, carrierAttrs, ctx.pressure, undefined, xg, 0, matchContext.match_minute || 0, 0, 0);
       const r = rng.random();
       if (r < pShoot) {
         return { type: 'shoot', subType: 'attackShot', context: ctx };
@@ -303,7 +320,7 @@ function determineSituation(rng, ballZone, carrierRole, carrierAttrs, possession
         return { type: 'tackle', subType: 'counterPress', context: ctx };
       }
       const xg = estimateXG(v, ctx);
-      const { pPass, pDribble } = decisionProbs(ballZone, carrierRole, carrierAttrs, ctx.pressure, undefined, xg, 0, matchContext.match_minute || 0);
+      const { pPass, pDribble } = decisionProbs(ballZone, carrierRole, carrierAttrs, ctx.pressure, undefined, xg, 0, matchContext.match_minute || 0, 0, 0);
       if (rng.random() < pDribble / (pDribble + pPass)) {
         return { type: 'dribble', subType: 'counter', context: ctx };
       }
@@ -313,7 +330,7 @@ function determineSituation(rng, ballZone, carrierRole, carrierAttrs, possession
     // 进攻球员在中场前区：决策
     if (/^(ST_|W_|IF_|AM_)/.test(carrierRole)) {
       const xg = estimateXG(v, ctx);
-      const { pShoot, pPass, pDribble } = decisionProbs(ballZone, carrierRole, carrierAttrs, ctx.pressure, undefined, xg, 0, matchContext.match_minute || 0);
+      const { pShoot, pPass, pDribble } = decisionProbs(ballZone, carrierRole, carrierAttrs, ctx.pressure, undefined, xg, 0, matchContext.match_minute || 0, 0, 0);
       const r = rng.random();
       if (r < pShoot) {
         return { type: 'shoot', subType: 'longShot', context: ctx };
@@ -325,7 +342,7 @@ function determineSituation(rng, ballZone, carrierRole, carrierAttrs, possession
     // 中场控制：决策 + 争顶
     {
       const xg = estimateXG(v, ctx);
-      const { pShoot, pPass, pDribble } = decisionProbs(ballZone, carrierRole, carrierAttrs, ctx.pressure, undefined, xg, 0, matchContext.match_minute || 0);
+      const { pShoot, pPass, pDribble } = decisionProbs(ballZone, carrierRole, carrierAttrs, ctx.pressure, undefined, xg, 0, matchContext.match_minute || 0, 0, 0);
       if (contestCheck()) {
         return { type: 'contest', subType: 'midfieldContest', context: { ...ctx, intent: 'possession' } };
       }

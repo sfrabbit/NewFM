@@ -1,13 +1,20 @@
 # TODO — 决策模型待实现/待扩展项
 
-## 射门意愿（shootWillingness）
-- **当前**：默认值2.0，所有球员统一
-- **待实现**：
-  - 战术开关：教练指令 `shoot_more` / `shoot_less` 修改系数
-  - 球员个性：`团队导向`低 + `自信`高 → 更倾向射门（自私型射手）
-  - 位置影响：中锋可用比后卫更高的射门意愿基线值
-- **涉及文件**：`situations.js` → `zoneBaseline(shootWillingness)`
-- **依赖模块**：球员个性系统、战术指令系统（均未实现）
+## 战术预留参数（已实现接口，默认=0）
+- **shootWillingness** → `shootUtility(xg, personalModifier)` 通过 `personalModifier` 介入
+- **passTendency** → `passUtility(v, pressure, passTendency)` 通过 `Math.exp(passTendency)` 乘入
+- **dribbleTendency** → `dribbleUtility(v, pressure, xg, dribbleTendency)` 通过 `Math.exp(dribbleTendency)` 乘入
+- **待实现**：三个参数均由战术系统中对应字段填入（如 `shoot_more`/`shoot_less`、`dribble_more`/`hold_ball` 等）。当前 `determineSituation` 中均传 `0`
+- **涉及文件**：`situations.js` → `decisionProbs` + 三个 utility 函数
+- **依赖模块**：战术指令系统（未实现）
+
+## 射门意愿（shootWillingness）✅ 已预留
+- **当前**：`shootWillingness=0`，所有球员统一。通过 `personalModifier` 组合了：
+  - `shootWillingness`（战术预留，=0）
+  - `timePressureBonus`（80'后自动生效）
+  - `(自信-10)*0.02 + (10-团队)*0.02`（球员个性）
+- **待实现**：战术开关填入 `shootWillingness`
+- **依赖模块**：战术指令系统（未实现）
 
 ## 抢断决策重设计
 - **当前**：压力阈值 + 随机数触发，无防守球员因素
