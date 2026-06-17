@@ -79,8 +79,8 @@ function buildContext(ballZone, opponentZones, matchContext = {}) {
 // personalModifier 综合以下因素：
 //   + shootWillingness   (战术预留，默认0，将来可正可负)
 //   + timePressureBonus  (比赛最后10分钟，0 → 0.3)
-//   + (自信-10)*0.02     (自信高 → 更敢射)
-//   + (10-团队)*0.02     (团队低 → 更爱单干)
+//   + (自信-10)*0.04     (自信高 → 更敢射；极端值≈±0.4，可与战术值同级)
+//   + (10-团队)*0.04     (团队低 → 更爱单干；极端值≈±0.4，可大致抵消战术)
 function shootUtility(xgValue, personalModifier = 0) {
   return xgValue * Math.exp(personalModifier);
 }
@@ -151,7 +151,7 @@ function decisionProbs(ballZone, role, attrs, pressure, tacticPos, xgValue, shoo
   // 球员个性：自信↑ → 更敢射；团队↓ → 更爱单干
   const confidence = (attrs['自信'] != null) ? attrs['自信'] : 10;
   const teamwork = (attrs['团队'] != null) ? attrs['团队'] : 10;
-  const personalityBonus = (confidence - 10) * 0.02 + (10 - teamwork) * 0.02;
+  const personalityBonus = (confidence - 10) * 0.04 + (10 - teamwork) * 0.04;
 
   const personalModifier = shootWillingness + timePressureBonus + personalityBonus;
 

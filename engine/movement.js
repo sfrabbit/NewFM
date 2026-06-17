@@ -197,7 +197,8 @@ function calculateTargetPosition(player, context) {
 
   const {
     pitchWidth = 68, pitchLength = 105,
-    ballPosition = { x: 0, y: 0 }
+    ballPosition = { x: 0, y: 0 },
+    attackDirection = 1  // +1 = 攻击+x方向 (主队), -1 = 攻击-x方向 (客队)
   } = context;
 
   const attrs = player.attrs || {};
@@ -206,15 +207,33 @@ function calculateTargetPosition(player, context) {
   const dq = calculateDecisionQuality(attrs);
   const halfL = pitchLength / 2;
   const halfW = pitchWidth / 2;
-  const ballX = ballPosition.x;
+  
+  // 坐标系说明：
+  // - 所有位置使用共享坐标系：x ∈ [-52.5, 52.5]
+  // - 主队球门在 -52.5，客队球门在 +52.5
+  // - 主队攻击方向：+x，客队攻击方向：-x
+  // - defaultX/defaultY 已经是正确的共享坐标系值
+  const ad = attackDirection;  // +1=home, -1=away
+  
+  // 对于移动计算，我们使用"本地"坐标系（攻击方向总是+x）
+  // 这样GK总是在-x侧，ST总是在+x侧
+  const ballX = ballPosition.x * ad;
+  // 注意：y坐标不翻转，因为mirrorZone已经处理了左右翻转
+  // 客队的FB_L在mirror后站在右边（正y），这在共享坐标系中是正确的
   const ballY = ballPosition.y;
+  let baseX = defaultX * ad;  // 翻转后，baseX总是"从后往前"的方向
+  let baseY = defaultY;  // y不翻转，因为mirrorZone已经处理了左右
+  
+  // side已经是基于defaultY判断的，对于客队：
+  // - FB_L（左边后卫）mirror后站在右边（正y），side='right'
+  // - 在本地坐标系中，这对应右边（正y），所以不需要翻转side
+  const localSide = side;
 
   const highPress = (tacticalStyle === 'high_press');
   const lowBlock = (tacticalStyle === 'low_block');
   const counterAtk = (tacticalStyle === 'counter_attack');
   const defLine = calculateDefensiveLineHeight(tacticalStyle, footballIQ);
 
-  let baseX = defaultX, baseY = defaultY;
   let ox = 0, oy = 0;
 
   switch (pos) {
@@ -242,16 +261,22 @@ function calculateTargetPosition(player, context) {
       const isCentralCB = isThreeCB && absWidth < 6;
 
       if (teamRole === 'defending') {
-        baseX = (defLine / 100) * halfL * 0.85;
+        // defLine 0-100, 映射到本地坐标系（负值=后场）
+        // 对于主队：-45到0，对于客队（翻转后）：-45到0
+        baseX = -(defLine / 100) * halfL * 0.85;
         ox = (ballX - baseX) * 0.2;
         oy = isThreeCB && !isCentralCB
-          ? (side === 'left' ? -8 : 8)
-          : (side === 'left' ? -5 : 5);
+          ? (localSide === 'left' ? -8 : 8)
+          : (localSide === 'left' ? -5 : 5);
         if (lowBlock) oy *= 0.7;
       } else {
-        ox = Math.min(ballX - 15, halfL * 0.5);
+        // 进攻时CB应该压上，但保持谨慎（不超过中场太多）
+        // ballX是本地坐标（总是正值=进攻方向）
+        // 如果球在前场，CB压上到球后方15-25m
+        const targetX = Math.max(-20, ballX - 25);  // 最靠前到-20m（中场）
+        ox = targetX - baseX;  // 相对于当前baseX的偏移
         if (isThreeCB && !isCentralCB)
-          oy = (side === 'left' ? -6 : 6);
+          oy = (localSide === 'left' ? -6 : 6);
       }
       break;
     }
@@ -260,16 +285,17 @@ function calculateTargetPosition(player, context) {
     // 边翼卫（基于结构推导，而非阵型名）
     // =========================================================
     case 'WB': {
-      const sideY = side === 'left' ? -halfW * 0.9 : halfW * 0.9;
+      const sideY = localSide === 'left' ? -halfW * 0.9 : halfW * 0.9;
       if (teamRole === 'attacking') {
         ox = (ballX - baseX) * 0.7;
         oy = sideY - baseY;
         if (highPress) ox += 8;
       } else {
-        baseX = (defLine / 100) * halfL * 0.85;
+        // 防守时WB应该在防线附近（本地坐标系的负值=后场）
+        baseX = -((defLine / 100) * halfL * 0.85);
         ox = (ballX - baseX) * 0.3;
         oy = sideY - baseY;
-        if (lowBlock) { baseX += 5; ox -= 3; }
+        if (lowBlock) { baseX -= 5; ox -= 3; }
       }
       break;
     }
@@ -278,24 +304,27 @@ function calculateTargetPosition(player, context) {
     // 边后卫（通用4后卫体系）
     // =========================================================
     case 'FB': {
-      const sideY = side === 'left' ? -halfW * 0.7 : halfW * 0.7;
+      const sideY = localSide === 'left' ? -halfW * 0.7 : halfW * 0.7;
       const hasWM = hasWM_SameSide;
 
       if (teamRole === 'attacking') {
         let af = 0.50; // 基础套边系数
-        if (!hasWM) af += 0.10;  // 无同侧WM → 更积极（你是主要宽度来源）
-        if (hasWM)  af -= 0.05;  // 有同侧WM → 不需要过度套边（WM已提供宽度）
+        // 暂时禁用hasWM影响以测试宽度
+        // if (!hasWM) af += 0.10;
+        // if (hasWM)  af -= 0.05;
         if (highPress) af += 0.05;
         if (counterAtk) af += 0.15;
 
         ox = (ballX - baseX) * af;
+        // FB应该保持宽度，直接向sideY移动
         oy = sideY - baseY;
 
-        // 中场阻截: 内收到中场
+        // 中场阻截: 内收到中场（但保持一定宽度）
         if (tacticalStyle === 'medium_block' && dq > 0.55)
-          oy *= 0.5;
+          oy *= 0.7;  // 从0.5改为0.7，保持更多宽度
       } else {
-        baseX = (defLine / 100) * halfL * 0.85;
+        // 防守时FB应该在防线附近（本地坐标系的负值=后场）
+        baseX = -((defLine / 100) * halfL * 0.85);
         let rf = 0.3;
         if (lowBlock) rf = 0.5;
         if (counterAtk) rf = 0.6;
@@ -312,7 +341,8 @@ function calculateTargetPosition(player, context) {
     case 'DM': {
       const isSoloDM = sameTypeCount === 1;
       if (teamRole === 'defending') {
-        baseX = (defLine / 100) * halfL * 0.85 + 8;
+        // 防守时DM应该在防线附近（本地坐标系的负值=后场）
+        baseX = -((defLine / 100) * halfL * 0.85 + 8);
         ox = (ballX - baseX) * 0.4;
         oy = isSoloDM ? (ballY - baseY) * 0.6 : (ballY - baseY) * 0.35;
         if (lowBlock) { baseX -= 5; ox -= 2; }
@@ -349,7 +379,8 @@ function calculateTargetPosition(player, context) {
         ox = (ballX - baseX) * af + 5;
         oy = (ballY - baseY) * (isCentral ? 0.5 : 0.7);
       } else {
-        baseX = (defLine / 100) * halfL * 0.85 + 12;
+        // 防守时CM应该在防线前方一点（本地坐标系的负值=后场）
+        baseX = -((defLine / 100) * halfL * 0.85 + 12);
         ox = (ballX - baseX) * 0.35;
         oy = (ballY - baseY) * (isCentral ? 0.5 : 0.7);
         if (lowBlock) { baseX -= 5; ox -= 2; }
@@ -381,7 +412,7 @@ function calculateTargetPosition(player, context) {
     // =========================================================
     case 'WM': {
       const invertFoot = attrs.决断速度 > 14 &&
-        player.preferredFoot === (side === 'left' ? 'right' : 'left');
+        player.preferredFoot === (localSide === 'left' ? 'right' : 'left');
       const hasFB_B = hasFB_SameSide;
 
       if (teamRole === 'attacking') {
@@ -398,7 +429,7 @@ function calculateTargetPosition(player, context) {
           oy = (ballY - baseY) * 0.4;
         } else {
           ox = (ballX - baseX) * af;
-          oy = (side === 'left' ? -halfW * 0.8 : halfW * 0.8) - baseY;
+          oy = (localSide === 'left' ? -halfW * 0.8 : halfW * 0.8) - baseY;
         }
 
         // 无FB/WB在身后 → 需要更深回收(4-4-2的WM)
@@ -411,7 +442,7 @@ function calculateTargetPosition(player, context) {
         else               rf = 0.30;
 
         ox = (ballX - baseX) * rf;
-        oy = (side === 'left' ? -halfW * 0.6 : halfW * 0.6) - baseY;
+        oy = (localSide === 'left' ? -halfW * 0.6 : halfW * 0.6) - baseY;
         if (lowBlock) oy *= 0.7;
       }
       break;
@@ -455,10 +486,17 @@ function calculateTargetPosition(player, context) {
     }
   }
 
-  const fx = baseX + ox * dq;
-  const fy = baseY + oy * dq;
+  // 注意：这里的baseX已经在前面被翻转过了，所以直接用
+  // ox是基于翻转后的坐标系计算的
+  // dq是决策质量，用于战术决策，但移动距离应该更自由
+  // 使用最小0.8的乘数确保球员能够充分移动
+  const moveFactor = Math.max(0.8, dq);
+  const fx = baseX + ox * moveFactor;
+  const fy = baseY + oy * moveFactor;
+  
+  // 如果攻击方向是-x，需要把结果翻转回原始坐标系
   return {
-    x: Math.max(-halfL + 1, Math.min(halfL - 1, fx)),
+    x: Math.max(-halfL + 1, Math.min(halfL - 1, fx * ad)),
     y: Math.max(-halfW + 1, Math.min(halfW - 1, fy))
   };
 }
@@ -534,24 +572,67 @@ function updatePlayerPositions(players, context, deltaTime = 1) {
 
   for (let i = 0; i < players.length; i++) {
     const p = players[i];
+    // 根据球队确定攻击方向: home=+1 (攻击+x), away=-1 (攻击-x)
+    const attackDirection = p.team === 'home' ? 1 : -1;
     const target = calculateTargetPositionEx(
       { ...p, idx: i, structure: null },
-      { ...context, allPlayers: players }
+      { ...context, allPlayers: players, attackDirection }
     );
 
     const dx = target.x - (p.x || p.defaultX || 0);
     const dy = target.y - (p.y || p.defaultY || 0);
     const dist = Math.sqrt(dx * dx + dy * dy);
 
-    const speed = calculateMovementSpeed(
+    let speed = calculateMovementSpeed(
       p.attrs.速度 || 10, p.attrs.耐力 || 10, p.fatigue || 0
     );
-    const maxMove = speed * deltaTime;
-    const move = Math.min(dist, maxMove);
+    
+    // 根据位置调整速度（不同位置跑动距离不同）
+    const rolePrefix = (p.role || '').split('_')[0];
+    const positionSpeedFactors = {
+      'GK': 0.25,  // GK跑动最少
+      'CB': 0.70,  // 中后卫跑动较少
+      'FB': 0.85,  // 边后卫跑动较多
+      'WB': 0.90,  // 翼卫跑动最多
+      'DM': 0.80,
+      'CM': 0.75,  // 中场跑动适中
+      'AM': 0.75,
+      'WM': 0.85,  // 边锋跑动较多
+      'ST': 0.70   // 前锋跑动较少（但冲刺多）
+    };
+    const speedFactor = positionSpeedFactors[rolePrefix] || 0.75;
+    speed *= speedFactor;
+    
+    // 现实足球中，球员在dt时间内始终以speed移动（围绕目标位置跑动）
+    // 不是只移动到目标位置就停止
+    // 使用0.7乘数模拟球员并非全速奔跑（有停顿、变速）
+    const effectiveSpeed = speed * 0.7;
+    const maxMove = effectiveSpeed * deltaTime;
+    
+    // 如果目标很远，向目标移动；如果已经接近目标，围绕目标小范围跑动
+    let move, moveDx, moveDy;
+    if (dist > 5) {
+      // 向目标移动
+      move = Math.min(dist, maxMove);
+      moveDx = (dx / dist) * move;
+      moveDy = (dy / dist) * move;
+    } else {
+      // 接近目标，围绕目标跑动（模拟无球跑动）
+      // 使用随机方向模拟球员调整位置
+      move = maxMove * 0.5;  // 接近目标时移动距离减半
+      const jitterAngle = (Math.random() - 0.5) * Math.PI;  // -90到+90度随机偏移
+      moveDx = Math.cos(jitterAngle) * move;
+      moveDy = Math.sin(jitterAngle) * move;
+    }
 
     let nx = p.x || p.defaultX || 0;
     let ny = p.y || p.defaultY || 0;
-    if (dist > 0.1) { nx += (dx / dist) * move; ny += (dy / dist) * move; }
+    nx += moveDx;
+    ny += moveDy;
+    
+    // 限制在球场范围内
+    nx = Math.max(-52.5 + 1, Math.min(52.5 - 1, nx));
+    ny = Math.max(-34 + 1, Math.min(34 - 1, ny));
 
     const newFatigue = Math.min(1, (p.fatigue || 0) +
       (move / 15000) * (1 - (p.attrs.耐力 || 10) / 20));

@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Live Test</title>
+  <style>
+    body { background: #0b1220; color: #fff; font-family: sans-serif; padding: 20px; }
+    #pitch { width: 300px; height: 475px; background: #14572a; position: relative; border: 2px solid #fff; margin: 20px 0; }
+    .player { position: absolute; width: 12px; height: 12px; border-radius: 50%; transform: translate(-50%, -50%); font-size: 8px; text-align: center; line-height: 12px; }
+    .home { background: #ef4444; }
+    .away { background: #3b82f6; }
+    .ball { position: absolute; width: 10px; height: 10px; background: #fbbf24; border-radius: 50%; transform: translate(-50%, -50%); border: 2px solid #fff; }
+    #log { font-size: 11px; font-family: monospace; max-height: 200px; overflow-y: auto; background: #1a1a1a; padding: 10px; }
+  </style>
+</head>
+<body>
+  <h2>Live 2D Test</h2>
+  <button onclick="startMatch()">Start Match</button>
+  <div id="pitch"></div>
+  <div id="log"></div>
+  
+  <script>
+    const API = 'http://localhost:8080/api';
+    let matchData = null;
+    let eventIndex = 0;
+    
+    function log(msg) {
+      document.getElementById('log').innerHTML += msg + '<br>';
+    }
+    
+    function realCoordToSVG(x, y) {
+      const W = 300, H = 475;
+      const xPct = (x + 52.5) / 105 * 100;
+      const yPct = (y + 34) / 68 * 100;
+      return [(xPct / 100) * W, H - (yPct / 100) * H];
+    }
+    
+    async function startMatch() {
+      log('Starting match...');
+      
+      const res = await fetch(`${API}/match/simulate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          home: { players: [], formation: '4-3-3' },
+          away: { players: [], formation: '4-3-3' }
+        })
+      });
+      
+      matchData = await res.json();
+      log(`Match started: ${matchData.events.length} events`);
+      
+      // Play first few events
+      for (let i = 0; i < 5 && i < matchData.events.length; i++) {
+        await playEvent(i);
+        await new Promise(r => setTimeout(r, 1000));
+      }
+    }
+    
+    function playEvent(idx) {
+      const ev = matchData.events[idx];
+      const pitch = document.getElementById('pitch');
+      pitch.innerHTML = '';
+      
+      log(`<b>Event ${idx + 1}</b>: ${ev.desc}`);
+      log(`Carrier: ${ev.carrier_pid}, Zone: ${ev.zone}`);
+      
+      if (!ev.positions) {
+        log('ERROR: No positions data!');
+        return;
+      }
+      
+      // Render all players
+      let playerCount = 0;
+      for (const [key, pos] of Object.entries(ev.positions)) {
+        if (!pos || pos.x === undefined) continue;
+        
+        const side = key.startsWith('home') ? 'home' : 'away';
+        const [x, y] = realCoordToSVG(pos.x, pos.y);
+        
+        const div = document.createElement('div');
+        div.className = `player ${side}`;
+        div.style.left = x + 'px';
+        div.style.top = y + 'px';
+        pitch.appendChild(div);
+        playerCount++;
+        
+        // Highlight carrier
+        if (key.includes(ev.carrier_pid)) {
+          div.style.border = '2px solid #fff';
+          div.style.zIndex = 10;
+          log(`Carrier ${ev.carrier_pid} at (${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}) -> SVG(${x.toFixed(0)}, ${y.toFixed(0)})`);
+        }
+      }
+      
+      // Render ball at carrier position
+      if (ev.carrier_x !== undefined && ev.carrier_y !== undefined) {
+        const [bx, by] = realCoordToSVG(ev.carrier_x, ev.carrier_y);
+        const ball = document.createElement('div');
+        ball.className = 'ball';
+        ball.style.left = bx + 'px';
+        ball.style.top = by + 'px';
+        pitch.appendChild(ball);
+        log(`Ball at (${ev.carrier_x.toFixed(1)}, ${ev.carrier_y.toFixed(1)}) -> SVG(${bx.toFixed(0)}, ${by.toFixed(0)})`);
+      }
+      
+      log(`Rendered ${playerCount} players`);
+      log('---');
+    }
+  </script>
+</body>
+</html>

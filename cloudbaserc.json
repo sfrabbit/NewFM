@@ -1,0 +1,25 @@
+{
+  "version": "2.0",
+  "envId": "newfm-270069-8",
+  "framework": {
+    "name": "fm-tactical-engine",
+    "plugins": {
+      "node": {
+        "use": "@cloudbase/framework-plugin-node",
+        "inputs": {
+          "name": "fm-server",
+          "path": "/api",
+          "entry": "server/index.js",
+          "installDependency": true
+        }
+      },
+      "website": {
+        "use": "@cloudbase/framework-plugin-website",
+        "inputs": {
+          "buildOutput": "./public",
+          "cloudPath": "/"
+        }
+      }
+    }
+  }
+}

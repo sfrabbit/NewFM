@@ -96,7 +96,9 @@ header h1 .pill{font-size:0.65rem;background:var(--accent);color:#001b2e;padding
 .pitch-svg .zone-label{font-family:sans-serif;font-size:1.4px;fill:rgba(255,255,255,0.55);text-anchor:middle;dominant-baseline:central;pointer-events:none;font-weight:600;letter-spacing:0.05px}
 .pitch-svg .lane-tag{font-family:sans-serif;font-size:1.6px;fill:rgba(56,189,248,0.85);text-anchor:middle;dominant-baseline:central;pointer-events:none;font-weight:800}
 .pitch-svg .band-tag{font-family:sans-serif;font-size:1.6px;fill:rgba(251,191,36,0.85);text-anchor:start;dominant-baseline:central;pointer-events:none;font-weight:800}
-.pitch-svg .player-dot{cursor:help;transition:transform .2s}
+.pitch-svg .player-dot{cursor:help;transition:transform 0.3s ease-out}
+.pitch-svg .mp-player{transition:transform 0.3s ease-out}
+#mp-ball{transition:cx 0.3s ease-out,cy 0.3s ease-out}
 .pitch-svg .player-dot circle{stroke:#fff;stroke-width:0.4}
 .pitch-svg .player-dot text{font-family:sans-serif;font-size:2.5px;font-weight:700;fill:#fff;text-anchor:middle;dominant-baseline:central;pointer-events:none}
 .pitch-svg .player-dot.elite circle{stroke:var(--gold);stroke-width:0.7;filter:drop-shadow(0 0 1.5px var(--gold))}
@@ -488,7 +490,29 @@ function drawMiniPitch() {
   host.innerHTML = h;
 }
 
-// ════ Player sub-zone positioning ════
+// ════ Player positioning with real coordinates ════
+// Backend sends real meter coordinates (x,y) where:
+//   x ∈ [-52.5, 52.5] (negative=own half, positive=opponent half)
+//   y ∈ [-34, 34] (negative=left, positive=right from home perspective)
+// Frontend SVG: viewBox="0 0 60 95"
+
+// Map real meter coordinates to SVG pixel coordinates
+// Backend: x ∈ [-52.5, 52.5], y ∈ [-34, 34] (shared coordinate system)
+// Both teams use the same coordinate system, no flip needed
+// Frontend SVG: viewBox="0 0 60 95"
+function realCoordToSVG(x, y, side) {
+  const W = 60, H = 95;
+  // x: -52.5~52.5 → 0~100 (percentage) → 0~W (SVG)
+  // y: -34~34 → 0~100 (percentage) → 0~H (SVG, flipped because y=0 is top)
+  const xPct = (x + 52.5) / 105 * 100;
+  const yPct = (y + 34) / 68 * 100;
+  return [
+    (xPct / 100) * W,
+    H - (yPct / 100) * H
+  ];
+}
+
+// Fallback: role-based sub-offset within zone (for initial placement before first tick)
 const ROLE_SUB = {
   GK:   { dx:  0.00, dy:  0.45 },
   CB_L: { dx: -0.12, dy:  0.25 }, CB_R: { dx:  0.12, dy:  0.25 },
@@ -510,8 +534,7 @@ function _zoneSize(zoneId) {
   return [((hl.hy[1] - hl.hy[0]) / 100) * 60, ((vb.vy[1] - vb.vy[0]) / 100) * 95];
 }
 
-// Shared-pitch coordinates. Server already mirrors away positions (mirrorZone with H_MIRROR)
-// so the frontend treats all zone IDs as-is on the same shared grid.
+// Zone center to SVG (fallback when real coords not available)
 function miniZoneToXY(zoneId) {
   const W = 60, H = 95;
   const v = zoneId.split('_').slice(0, -1).join('_'), l = zoneId.split('_').pop();
@@ -522,8 +545,15 @@ function miniZoneToXY(zoneId) {
   return [(hyMid / 100) * W, H - (vyMid / 100) * H];
 }
 
-// Place a player in their tactical-default zone with role-based sub-offset, clamped.
-function placePlayer(zoneId, role, side) {
+// Place a player using real coordinates if available, otherwise zone-based fallback
+function placePlayer(p, side) {
+  // If player has real coordinates from backend, use them
+  if (p.x !== undefined && p.y !== undefined) {
+    return realCoordToSVG(p.x, p.y, side);
+  }
+  // Fallback: zone-based positioning with role offset
+  const zoneId = p.zone;
+  const role = p.role;
   const [bx, by] = miniZoneToXY(zoneId);
   const [zw, zh] = _zoneSize(zoneId);
   const sub = ROLE_SUB[role] || { dx: 0, dy: 0 };
@@ -568,7 +598,7 @@ function _resolveOverlaps(items) {
   }
 }
 
-// Draw 22 player dots via insertAdjacentHTML (no createElementNS namespace issues).
+// Draw 22 player dots using real coordinates from backend.
 function renderMatchPlayers(homePos, awayPos) {
   const host = document.getElementById('mini-pitch');
   if (!host) return;
@@ -581,8 +611,9 @@ function renderMatchPlayers(homePos, awayPos) {
     if (!list || !list.length) return;
     const items = [];
     list.forEach(p => {
-      if (!p || !p.zone || !p.pid) return;
-      const [x, y] = placePlayer(p.zone, p.role, side);
+      if (!p || !p.pid) return;
+      // Use real coordinates (x,y) from backend if available, else fallback to zone-based
+      const [x, y] = placePlayer(p, side);
       items.push({ x, y, p, color });
     });
     _resolveOverlaps(items);
@@ -602,7 +633,31 @@ function renderMatchPlayers(homePos, awayPos) {
 }
 
 let __lastCarrierKey = null;
-function moveCarrier(side, pid, zone) {
+
+// Highlight the carrier without moving it (movement is handled by renderAllPositions)
+function highlightCarrier(side, pid) {
+  const host = document.getElementById('mini-pitch');
+  if (!host) return;
+  const svg = host.querySelector('svg');
+  if (!svg) return;
+  
+  // Remove previous carrier highlight
+  if (__lastCarrierKey) {
+    const prev = svg.querySelector('[id="mp-p-' + __lastCarrierKey + '"]');
+    if (prev) prev.classList.remove('carrier');
+  }
+  
+  if (!side || !pid) { __lastCarrierKey = null; return; }
+  
+  const key = `${side}-${pid}`;
+  const g = svg.querySelector('[id="mp-p-' + key + '"]');
+  if (!g) { __lastCarrierKey = null; return; }
+  
+  g.classList.add('carrier');
+  __lastCarrierKey = key;
+}
+
+function moveCarrier(side, pid, zone, realX, realY) {
   const host = document.getElementById('mini-pitch');
   if (!host) return;
   const svg = host.querySelector('svg');
@@ -619,38 +674,96 @@ function moveCarrier(side, pid, zone) {
   const key = `${side}-${pid}`;
   const g = svg.querySelector('[id="mp-p-' + key + '"]');
   if (!g) { __lastCarrierKey = null; return; }
-  let role = 'CM_C';
-  try {
-    const positions = side === 'home' ? (MATCH.home_positions || []) : (MATCH.away_positions || []);
-    const player = positions.find(p => p.pid === pid);
-    if (player) role = player.role;
-  } catch (_) {}
-  const [x, y] = placeCarrierInZone(zone, role, side);
+
+  let x, y;
+  // Use real coordinates if provided, else fallback to zone-based positioning
+  if (realX !== undefined && realY !== undefined) {
+    [x, y] = realCoordToSVG(realX, realY, side);
+  } else {
+    let role = 'CM_C';
+    try {
+      const positions = side === 'home' ? (MATCH.home_positions || []) : (MATCH.away_positions || []);
+      const player = positions.find(p => p.pid === pid);
+      if (player) role = player.role;
+    } catch (_) {}
+    [x, y] = placeCarrierInZone(zone, role, side);
+  }
   g.setAttribute('transform', 'translate(' + x + ',' + y + ')');
   g.classList.add('carrier');
   __lastCarrierKey = key;
 }
 
-// Step 4: render all player dots from position snapshot
+// Step 4: render all player dots from position snapshot (using real coordinates)
 function renderAllPositions(positions) {
   const host = document.getElementById('mini-pitch');
-  if (!host || !positions) return;
+  if (!host || !positions) {
+    console.log('renderAllPositions: no host or positions');
+    return;
+  }
   const svg = host.querySelector('svg');
-  if (!svg) return;
-  for (const [key, zone] of Object.entries(positions)) {
-    if (!zone) continue;
-    // key format: "home_主队_ST_C_1" or "away_客队_CB_C_1"
+  if (!svg) {
+    console.log('renderAllPositions: no svg');
+    return;
+  }
+  
+  let updated = 0, missing = 0;
+  // Debug: show first key format
+  const firstKey = Object.keys(positions)[0];
+  
+  for (const [key, pos] of Object.entries(positions)) {
+    if (!pos) continue;
+    // key format: "home_pid" or "away_pid"
     const usIdx = key.indexOf('_');
     const side = key.substring(0, usIdx);
     const pid = key.substring(usIdx + 1);
-    const g = svg.querySelector('[id="mp-p-' + side + '-' + pid + '"]');
-    if (!g) continue;
-    const [x, y] = miniZoneToXY(zone);
+    const selector = 'mp-p-' + side + '-' + pid;
+    const g = svg.querySelector('[id="' + selector + '"]');
+    if (!g) {
+      missing++;
+      continue;
+    }
+    // Use real coordinates (x,y) if available, else fallback to zone-based
+    let x, y;
+    if (pos.x !== undefined && pos.y !== undefined) {
+      [x, y] = realCoordToSVG(pos.x, pos.y, side);
+    } else if (typeof pos === 'string') {
+      // Legacy: zone string
+      [x, y] = miniZoneToXY(pos);
+    } else {
+      continue;
+    }
     g.setAttribute('transform', 'translate(' + x + ',' + y + ')');
+    updated++;
   }
+  console.log(`renderAllPositions: updated ${updated}, missing ${missing}`);
 }
 
-function highlightMiniZone(zid, team) {
+// Track ball position using real coordinates
+let __lastBallX = null, __lastBallY = null;
+
+// Store previous positions for interpolation
+let __prevPositions = null;
+let __interpolationFrame = 0;
+const __interpolationSteps = 5; // 每两个事件之间插入5帧
+
+// Linear interpolation between two positions
+function interpolatePositions(from, to, t) {
+  const result = {};
+  for (const key of Object.keys(to)) {
+    if (from && from[key] && to[key]) {
+      result[key] = {
+        x: from[key].x + (to[key].x - from[key].x) * t,
+        y: from[key].y + (to[key].y - from[key].y) * t,
+        role: to[key].role
+      };
+    } else {
+      result[key] = to[key];
+    }
+  }
+  return result;
+}
+
+function highlightMiniZone(zid, team, carrierX, carrierY) {
   const host = document.getElementById('mini-pitch');
   if (!host) return;
   host.querySelectorAll('.mp-cell').forEach(c => c.classList.remove('active','attack','defend'));
@@ -664,10 +777,24 @@ function highlightMiniZone(zid, team) {
   else if (team === 'home' && (v === 'BOX_D' || v === 'DEEP_D')) cls = 'defend';
   else if (team === 'away' && (v === 'BOX_A' || v === 'DEEP_A')) cls = 'defend';
   cell.classList.add(cls);
+  
+  // Place ball at carrier's real position (not zone center)
   const ball = document.getElementById('mp-ball');
   if (ball) {
-    const cx = parseFloat(cell.getAttribute('x')) + parseFloat(cell.getAttribute('width'))/2;
-    const cy = parseFloat(cell.getAttribute('y')) + parseFloat(cell.getAttribute('height'))/2;
+    let cx, cy;
+    if (carrierX !== undefined && carrierY !== undefined) {
+      // Use carrier's real coordinates
+      [cx, cy] = realCoordToSVG(carrierX, carrierY, team);
+      __lastBallX = carrierX;
+      __lastBallY = carrierY;
+    } else if (__lastBallX !== null && __lastBallY !== null) {
+      // Fallback to last known position
+      [cx, cy] = realCoordToSVG(__lastBallX, __lastBallY, team);
+    } else {
+      // Fallback to zone center
+      cx = parseFloat(cell.getAttribute('x')) + parseFloat(cell.getAttribute('width'))/2;
+      cy = parseFloat(cell.getAttribute('y')) + parseFloat(cell.getAttribute('height'))/2;
+    }
     ball.setAttribute('cx', cx); ball.setAttribute('cy', cy); ball.style.display = '';
   }
   const lbl = document.getElementById('ball-zone-label');
@@ -1050,7 +1177,18 @@ async function startMatch() {
       home_cfg: CFG.home, away_cfg: CFG.away,
       home_positions: (res.summary && res.summary.home_positions) || [],
       away_positions: (res.summary && res.summary.away_positions) || [],
-      events: (res.events || []).map(e => ({ min: e.time || 0, text: (e.text || '').replace(/^L\d+:\s*/, ''), team: e.team || 'home', tags: e.tags || [], z: e.zone || null, cpid: e.carrier_pid || null, cside: e.carrier_side || null }))
+      events: (res.events || []).map(e => ({
+        min: e.time || 0,
+        text: (e.text || '').replace(/^L\d+:\s*/, ''),
+        team: e.team || 'home',
+        tags: e.tags || [],
+        z: e.zone || null,
+        cpid: e.carrier_pid || null,
+        cside: e.carrier_side || null,
+        carrier_x: e.carrier_x,
+        carrier_y: e.carrier_y,
+        positions: e.positions || null  // 22 players' positions for 2D visualization
+      }))
     };
 
     // Prepare match view
@@ -1109,14 +1247,50 @@ function play() {
   document.getElementById('commentary').appendChild(div);
   document.getElementById('commentary').scrollTop = document.getElementById('commentary').scrollHeight;
   document.getElementById('m-minute').textContent = ev.time + `'`;
-  if (ev.zone) highlightMiniZone(ev.zone, ev.team);
-  if (ev.carrier_pid && ev.carrier_side && ev.zone) moveCarrier(ev.carrier_side, ev.carrier_pid, ev.zone);
-  // Step 4: render all 22 players from position snapshot
-  if (ev.positions) renderAllPositions(ev.positions);
+  // Interpolation: if we have previous positions, interpolate between them
+  if (__prevPositions && ev.positions && __interpolationFrame < __interpolationSteps) {
+    const t = __interpolationFrame / __interpolationSteps;
+    const interpolated = interpolatePositions(__prevPositions, ev.positions, t);
+    renderAllPositions(interpolated);
+    
+    // Interpolate ball position too
+    if (ev.carrier_x !== undefined && ev.carrier_y !== undefined) {
+      const prevCarrier = __prevPositions[`home_${ev.cpid}`] || __prevPositions[`away_${ev.cpid}`];
+      if (prevCarrier) {
+        const ballX = prevCarrier.x + (ev.carrier_x - prevCarrier.x) * t;
+        const ballY = prevCarrier.y + (ev.carrier_y - prevCarrier.y) * t;
+        if (ev.z) highlightMiniZone(ev.z, ev.team, ballX, ballY);
+      } else {
+        if (ev.z) highlightMiniZone(ev.z, ev.team, ev.carrier_x, ev.carrier_y);
+      }
+    }
+    
+    __interpolationFrame++;
+    // Continue interpolation in next frame
+    const ms = speed === 1 ? 100 : speed === 2 ? 60 : speed === 5 ? 30 : 60;
+    timer = setTimeout(() => play(), ms);
+    return; // Don't advance to next event yet
+  }
+  
+  // Finished interpolation, move to next event
+  __prevPositions = ev.positions;
+  __interpolationFrame = 0;
+  
+  if (ev.z) highlightMiniZone(ev.z, ev.team, ev.carrier_x, ev.carrier_y);
+    // Render all 22 players from position snapshot (including carrier)
+    if (ev.positions) {
+      renderAllPositions(ev.positions);
+    }
+    // Highlight the carrier separately (without moving it)
+    if (ev.cpid && ev.cside) {
+      highlightCarrier(ev.cside, ev.cpid);
+    }
   updateLiveStats();
 
   if (speed === 0) { play(); return; }  // skip: render all immediately
-  const ms = speed === 1 ? 800 : speed === 2 ? 400 : speed === 5 ? 160 : 400;
+  // 计算合适的播放间隔，使动画看起来连续
+  // 如果事件间隔大，使用插值；如果间隔小，直接播放
+  const ms = speed === 1 ? 800 : speed === 2 ? 500 : speed === 5 ? 200 : 500;
   timer = setTimeout(play, ms);
 }
 

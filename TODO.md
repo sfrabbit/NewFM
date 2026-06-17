@@ -1,12 +1,52 @@
 # TODO — 决策模型待实现/待扩展项
 
-## 战术预留参数（已实现接口，默认=0）
+## 战术预留参数（已实现接口，默认=0）✅
 - **shootWillingness** → `shootUtility(xg, personalModifier)` 通过 `personalModifier` 介入
 - **passTendency** → `passUtility(v, pressure, passTendency)` 通过 `Math.exp(passTendency)` 乘入
 - **dribbleTendency** → `dribbleUtility(v, pressure, xg, dribbleTendency)` 通过 `Math.exp(dribbleTendency)` 乘入
+- **状态**：接口已实现，默认=0
 - **待实现**：三个参数均由战术系统中对应字段填入（如 `shoot_more`/`shoot_less`、`dribble_more`/`hold_ball` 等）。当前 `determineSituation` 中均传 `0`
 - **涉及文件**：`situations.js` → `decisionProbs` + 三个 utility 函数
 - **依赖模块**：战术指令系统（未实现）
+
+## 22人真实坐标可视化 ✅ 已完成
+- **后端**：`match.js` 中 `_playerCoords` 追踪22人真实坐标（米制），每步更新
+- **后端**：`matchSummary()` 返回 `home_positions`/`away_positions` 包含 `x, y` 真实坐标
+- **后端**：每个事件包含 `carrier_x`, `carrier_y` 供前端使用
+- **前端**：`index.html` 新增 `realCoordToSVG(x, y)` 函数映射米制坐标到SVG像素
+- **前端**：`renderMatchPlayers()` 优先使用后端真实坐标，fallback到zone-based
+- **前端**：`moveCarrier()` 支持使用真实坐标移动持球者
+- **涉及文件**：`match.js`, `public/index.html`
+
+### 位置系统修复记录
+**问题**：客队球员位置错误（CB出现在对方半场、宽度不足等）
+**修复**：
+1. `_initPlayerCoords`：客队初始化时翻转y坐标（`y: -y`），确保`FB_L`始终站在左边
+2. `movement.js`：添加`attackDirection`参数，使用本地坐标系计算（攻击方向总是+x）
+3. 修复`calculateTargetPosition`中防守位置的符号（负值=后场）
+**验证**：`test_player_positions.js` 所有阵型（4-3-3, 4-4-2, 3-5-2, 4-2-3-1）位置分布符合现实逻辑
+
+### 移动系统修复记录
+**问题**：球员跑动距离过低（CM只有2.7km，应为11.5km）
+**修复**：
+1. `updatePlayerPositions`：球员在dt时间内持续移动（模拟无球跑动），而不是只移动到目标位置
+2. 添加位置类型速度因子：`GK:0.25, CB:0.70, FB:0.85, WB:0.90, CM:0.75, WM:0.85, ST:0.70`
+3. `_stepMovementPlayers`：将每个事件分成5个子步，让移动更平滑
+4. 动态时间乘数：短比赛使用乘数4，完整比赛使用乘数1
+**验证**：`test_movement_realism.js` 所有阵型所有位置跑动距离符合现实范围（GK 4-5km,  outfield 10-13km）
+
+### 2D可视化系统 ✅ 已完成
+**功能**：前端战术图显示22人实时位置
+**实现**：
+1. 后端：`matchSummary()` 返回 `home_positions`/`away_positions` 包含 `x, y` 真实坐标
+2. 前端：`realCoordToSVG(x, y)` 将米制坐标映射到SVG像素坐标
+3. 前端：`renderMatchPlayers()` 使用真实坐标渲染球员位置
+4. 前端：`moveCarrier()` 使用真实坐标移动持球者
+**坐标映射**：
+- 后端：x ∈ [-52.5, 52.5], y ∈ [-34, 34]（米）
+- 前端：viewBox="0 0 60 95"（SVG像素）
+- 映射公式：`xPct = (x + 52.5) / 105 * 100`, `yPct = (y + 34) / 68 * 100`
+**验证**：`test_2d_visualization.js` 坐标传输正确，SVG坐标在有效范围内
 
 ## 射门意愿（shootWillingness）✅ 已预留
 - **当前**：`shootWillingness=0`，所有球员统一。通过 `personalModifier` 组合了：

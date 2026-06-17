@@ -247,11 +247,15 @@ class MatchEngine {
   // 22人移动系统
   // ============================================================
 
-  /** 初始化所有22名球员的真实坐标(从zone推导) */
+  /** 初始化所有22名球员的真实坐标(从zone推导)
+   * 共享坐标系: x ∈ [-52.5, 52.5], 负=主队球门方向, 正=客队球门方向
+   * 主队攻击方向: +x, 客队攻击方向: -x
+   */
   _initPlayerCoords() {
     this._playerCoords = {};
+    const { mirrorZone: mz } = require("./zones");
 
-    // 主场: zone → 坐标
+    // 主场: 直接使用zone坐标 (主队攻击+x方向)
     for (const [pid, p] of Object.entries(this.home.players)) {
       const zone = getPlayerZone(p.role, this.home.tactics);
       const { x, y } = zoneToCoord(zone);
@@ -263,14 +267,18 @@ class MatchEngine {
       };
     }
 
-    // 客场: mirrored zone → 坐标, 然后翻转x(客场攻击方向相反)
-    const { mirrorZone: mz } = require("./zones");
+    // 客场: zone是"从客队视角"定义的，需要mirror到共享坐标系
+    // 客队攻击-x方向，所以他们的DEEP_D(后场)对应共享坐标系的DEEP_A(+x方向)
     for (const [pid, p] of Object.entries(this.away.players)) {
       const rawZone = getPlayerZone(p.role, this.away.tactics);
+      // mirror: 客队的后场(DEEP_D) → 共享坐标系的DEEP_A(+x侧)
       const zone = mz(rawZone);
       const { x, y } = zoneToCoord(zone);
+      // 重要：mirrorZone翻转了左右(L↔R)，导致客队的FB_L站在了右边
+      // 但FB_L应该始终站在左边(从该队视角)，所以我们需要翻转y坐标
+      // 这样客队的FB_L(y=-23.8)和主队的FB_L(y=-23.8)都在同一边(左边)
       this._playerCoords[pid] = {
-        x: -x, y: y, defaultX: -x, defaultY: y,
+        x, y: -y, defaultX: x, defaultY: -y,
         role: p.role, attrs: p.attrs,
         fatigue: 0, distanceCovered: 0,
         team: 'away'
@@ -335,11 +343,16 @@ class MatchEngine {
       allPlayers
     };
 
-    // 执行移动
-    const updated = updatePlayerPositions(allPlayers, ctx, dt);
+    // 执行移动 - 将大时间步分成多个小时间步，使球员持续向目标移动
+    const SUB_STEPS = 5;  // 每个事件分成5个小时间步
+    const subDT = dt / SUB_STEPS;
+    let currentPlayers = allPlayers;
+    for (let i = 0; i < SUB_STEPS; i++) {
+      currentPlayers = updatePlayerPositions(currentPlayers, ctx, subDT);
+    }
 
     // 回写坐标
-    for (const p of updated) {
+    for (const p of currentPlayers) {
       if (this._playerCoords[p.id]) {
         this._playerCoords[p.id].x = p.x;
         this._playerCoords[p.id].y = p.y;
@@ -349,7 +362,7 @@ class MatchEngine {
     }
 
     // 同步疲劳度到球员对象
-    for (const p of updated) {
+    for (const p of currentPlayers) {
       const team = p.team === 'home' ? this.home : this.away;
       const po = team.players[p.id];
       if (po) po.fatigue = p.fatigue || 0;
@@ -361,7 +374,7 @@ class MatchEngine {
       const snapshot = {
         tick: this._tickCount,
         minute: this.minute,
-        players: updated.map(p => ({
+        players: currentPlayers.map(p => ({
           id: p.id, role: p.role, team: p.team,
           x: p.x.toFixed(1), y: p.y.toFixed(1),
           fatigue: (p.fatigue * 100).toFixed(0) + '%'
@@ -420,62 +433,73 @@ class MatchEngine {
 
   _generateEventDescription(situation, actionType, result, playerName, zoneName) {
     const { type, subType } = situation;
+    const timeStr = this.minute !== undefined ? `${this.minute}'` : '0\'';
+    const ballZone = this.ball_zone || '未知区域';
+    
+    // 构建决策详情
+    let decisionDetail = '';
+    if (result.intent) {
+      if (result.intent.targetZone) decisionDetail += `→目标:${result.intent.targetZone} `;
+      if (result.intent.anticipation) decisionDetail += `预判:${result.intent.anticipation} `;
+    }
+    if (result.successProb !== undefined) decisionDetail += `成功率:${(result.successProb * 100).toFixed(0)}% `;
+    if (result.winProb !== undefined) decisionDetail += `胜率:${(result.winProb * 100).toFixed(0)}% `;
 
     switch (type) {
       case 'pass':
         if (result.successProb > 0.7) {
-          return `[${this.minute}'] ${playerName}在${zoneName}完成精准传球`;
+          return `[${timeStr}] ${playerName}在${zoneName}精准传球 ${decisionDetail}|球→${ballZone}`;
         } else if (result.successProb > 0.4) {
-          return `[${this.minute}'] ${playerName}在${zoneName}尝试传球${result.interceptProb > 0.3 ? '被拦截!' : ''}`;
+          return `[${timeStr}] ${playerName}在${zoneName}传球${result.interceptProb > 0.3 ? '被拦截!' : '成功'} ${decisionDetail}|球→${ballZone}`;
         } else {
-          return `[${this.minute}'] ${playerName}在${zoneName}传球失误`;
+          return `[${timeStr}] ${playerName}在${zoneName}传球失误 ${decisionDetail}|球→${ballZone}`;
         }
 
       case 'dribble':
         if (result.successRate > 0.7) {
-          return `[${this.minute}'] ${playerName}在${zoneName}成功盘带突破`;
+          return `[${timeStr}] ${playerName}在${zoneName}盘带突破 ${decisionDetail}|球→${ballZone}`;
         } else if (result.successRate > 0.4) {
-          return `[${this.minute}'] ${playerName}在${zoneName}尝试盘带${result.intent?.feint?.isDeceived ? '假动作骗过防守!' : ''}`;
+          return `[${timeStr}] ${playerName}在${zoneName}盘带${result.intent?.feint?.isDeceived ? '假动作!' : ''} ${decisionDetail}|球→${ballZone}`;
         } else {
-          return `[${this.minute}'] ${playerName}在${zoneName}盘带被断`;
+          return `[${timeStr}] ${playerName}在${zoneName}盘带被断 ${decisionDetail}|球→${ballZone}`;
         }
 
       case 'shoot':
         this.stats[this.possession === "home" ? "home" : "away"].shots += 1;
         if (result.totalProb > 0.3) {
           this.stats[this.possession === "home" ? "home" : "away"].shots_on_target += 1;
-          return `[${this.minute}'] ${playerName}在${zoneName}射门! 球进了! ⚽`;
+          return `[${timeStr}] ${playerName}在${zoneName}射门⚽进球! ${decisionDetail}|球→${ballZone}`;
         } else if (result.onTargetRate > 0.5) {
           this.stats[this.possession === "home" ? "home" : "away"].shots_on_target += 1;
-          return `[${this.minute}'] ${playerName}在${zoneName}射门! 被门将扑出!`;
+          return `[${timeStr}] ${playerName}在${zoneName}射门被扑 ${decisionDetail}|球→${ballZone}`;
         } else {
-          return `[${this.minute}'] ${playerName}在${zoneName}射门打偏`;
+          return `[${timeStr}] ${playerName}在${zoneName}射门打偏 ${decisionDetail}|球→${ballZone}`;
         }
 
       case 'tackle':
         if (result.winProb > 0.6) {
           this.stats[this.possession === "home" ? "home" : "away"].tackles += 1;
-          return `[${this.minute}'] ${playerName}成功抢断!${result.anticipation?.isCorrect ? '预判准确!' : ''}`;
+          return `[${timeStr}] ${playerName}抢断成功${result.anticipation?.isCorrect ? '(预判)' : ''} ${decisionDetail}|球→${ballZone}`;
         } else if (result.foulProb > 0.3) {
           this.stats[this.possession === "home" ? "home" : "away"].fouls += 1;
-          return `[${this.minute}'] ${playerName}抢断犯规!`;
+          return `[${timeStr}] ${playerName}抢断犯规 ${decisionDetail}|球→${ballZone}`;
         } else {
-          return `[${this.minute}'] ${playerName}抢断失败`;
+          return `[${timeStr}] ${playerName}抢断失败 ${decisionDetail}|球→${ballZone}`;
         }
 
       case 'contest':
         if (result.winProb > 0.6) {
-          return `[${this.minute}'] ${playerName}争顶成功!`;
+          return `[${timeStr}] ${playerName}争顶成功 ${decisionDetail}|球→${ballZone}`;
         } else {
-          return `[${this.minute}'] ${playerName}争顶失败`;
+          return `[${timeStr}] ${playerName}争顶失败 ${decisionDetail}|球→${ballZone}`;
         }
 
       case 'save':
         this.stats[this.possession === "home" ? "away" : "home"].saves += 1;
         if (result.saveProb > 0.5) {
-          return `[${this.minute}'] 门将精彩扑救!${result.anticipation?.isCorrect ? '预判准确!' : ''}`;
+          return `[${timeStr}] 门将扑救成功${result.anticipation?.isCorrect ? '(预判)' : ''} ${decisionDetail}|球→${ballZone}`;
         } else {
-          return `[${this.minute}'] 门将扑救失败`;
+          return `[${timeStr}] 门将扑救失败 ${decisionDetail}|球→${ballZone}`;
         }
 
       default:
@@ -731,9 +755,14 @@ class MatchEngine {
     this._syncBallCoord();
 
     // 8. 22人移动更新（在时间推进前，使用本次动作耗时）
+    // 注意：timeCost是动作执行时间，但球员在此期间和之后都在移动
     const timeCost = { pass: [8, 15], dribble: [10, 18], shoot: [5, 12], tackle: [8, 15], contest: [10, 18], save: [3, 8] };
     const [tmin, tmax] = timeCost[situation.type] || [10, 15];
-    const stepDT = (tmin + tmax) / 2;  // 平均秒数
+    const actionTime = (tmin + tmax) / 2;  // 平均秒数
+    
+    // 使用固定的合理时间步长，确保球员移动平滑且符合物理
+    // 目标：每次事件球员移动5-15米（现实足球中10-15秒内的移动距离）
+    const stepDT = Math.min(actionTime * 2, 30);  // 最大30秒，避免过大移动
     this._stepMovementPlayers(stepDT);
 
     // 9. 时间推进
@@ -749,6 +778,20 @@ class MatchEngine {
     this.is_scramble = false;
     this.set_piece = null;
 
+    // Get carrier's real coordinates for frontend visualization
+    const carrierCoord = this._playerCoords[this.ball_carrier] || null;
+
+    // Build positions snapshot for all 22 players (for frontend 2D visualization)
+    const positions = {};
+    for (const [pid, coord] of Object.entries(this._playerCoords)) {
+      const side = coord.team; // 'home' or 'away'
+      positions[`${side}_${pid}`] = {
+        x: coord.x,
+        y: coord.y,
+        role: coord.role
+      };
+    }
+
     const event = {
       type: situation.type,
       subType: situation.subType,
@@ -760,6 +803,9 @@ class MatchEngine {
       zone: this.ball_zone,
       carrier_pid: this.ball_carrier,
       carrier_side: this.possession,
+      carrier_x: carrierCoord ? carrierCoord.x : undefined,
+      carrier_y: carrierCoord ? carrierCoord.y : undefined,
+      positions, // All 22 players' positions for 2D visualization
       result: {
         successProb: result.successProb || result.successRate || result.winProb || result.saveProb,
         intent: result.intent || result.anticipation || null

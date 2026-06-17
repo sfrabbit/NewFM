@@ -1,5 +1,5 @@
 // ⚽ Football Tactical Engine — browser bundle
-// Auto-generated from engine/ modules (2026-06-15T18:17:36.640Z)
+// Auto-generated from engine/ modules (2026-06-17T09:40:25.142Z)
 (function(global) {
   const _mod = {};
 
@@ -895,7 +895,14 @@ function buildContext(ballZone, opponentZones, matchContext = {}) {
     defInLane,
     fatigue: matchContext.fatigue || 0,
     speedDiff: matchContext.speedDiff || 0,
-    angle: ballZone[1] * 18,
+    // zone格式: "V_BAND_LANE", 如 "MID_D_L", "BOX_A_CR"
+    // 从zone string提取lane: L=0, CL=1, C=2, CR=3, R=4 → 乘以18得角度
+    angle: (() => {
+      const parts = String(ballZone).split('_');
+      const laneCode = parts[2] || 'C';
+      const laneIdx = { L: 0, CL: 1, C: 2, CR: 3, R: 4 }[laneCode];
+      return (laneIdx != null ? laneIdx : 2) * 18;
+    })(),
     setPiece: matchContext.setPiece || 'none',
     ballHeight: Math.random() * 0.7 + 0.15,
     isFromClose: v === 'BOX_D' || v === 'BOX_A',
@@ -921,32 +928,52 @@ function buildContext(ballZone, opponentZones, matchContext = {}) {
 
 // ── 决策模型 ──
 // 射门/传球/盘带各自独立计算效用值，不互加减，用 softmax 比较
-// 每种行动的效用由物理条件决定，球员属性不影响决策（只影响执行质量）
+// 物理条件决定机会基线，球员属性 + 战术做个人化加权
 
-// ── 射门效用 = f(xG) ──
+// ── 射门效用 = f(xG, personalModifier) ──
 // xG 编码了距离+角度+压力 → 机会越好，射门效用越高
-function shootUtility(xgValue) {
-  return xgValue;
+// personalModifier 综合以下因素：
+//   + shootWillingness   (战术预留，默认0，将来可正可负)
+//   + timePressureBonus  (比赛最后10分钟，0 → 0.3)
+//   + (自信-10)*0.04     (自信高 → 更敢射；极端值≈±0.4，可与战术值同级)
+//   + (10-团队)*0.04     (团队低 → 更爱单干；极端值≈±0.4，可大致抵消战术)
+function shootUtility(xgValue, personalModifier = 0) {
+  return xgValue * Math.exp(personalModifier);
 }
 
-// ── 传球效用 = f(zone, pressure) ──
-function passUtility(v, pressure) {
-  if (v === 'BOX_A')      return 0.18;
-  if (v === 'DEEP_A')     return 0.20 + pressure * 0.05;
-  if (v === 'MID_A')      return 0.25 + pressure * 0.05;
-  if (v === 'MID_D')      return 0.25;
-  if (v === 'DEEP_D')     return 0.20;
-  if (v === 'BOX_D')      return 0.18;
-  return 0.20;
+// ── 传球效用 = f(zone, pressure, passTendency) ──
+// passTendency: 战术预留（默认0，将来可正可负。正=更倾向传球，负=更倾向不传）
+function passUtility(v, pressure, passTendency = 0) {
+  const tacticalMod = Math.exp(passTendency);
+  if (v === 'BOX_A')      return 0.18 * tacticalMod;
+  if (v === 'DEEP_A')     return (0.20 + pressure * 0.05) * tacticalMod;
+  if (v === 'MID_A')      return (0.25 + pressure * 0.05) * tacticalMod;
+  if (v === 'MID_D')      return 0.25 * tacticalMod;
+  if (v === 'DEEP_D')     return 0.20 * tacticalMod;
+  if (v === 'BOX_D')      return 0.18 * tacticalMod;
+  return 0.20 * tacticalMod;
 }
 
-// ── 盘带效用 = f(zone, pressure, xg) ──
-function dribbleUtility(v, pressure, xgValue) {
-  if (v === 'BOX_D' || v === 'DEEP_D') return 0.01;
+// ── 盘带效用 = f(distance→risk, pressure, xg, dribbleTendency) ──
+// 不是按zone分档，而是用离球门距离驱动的连续丢球风险模型：
+//   越靠近对方球门(d小) → 丢球后果轻 → 敢带
+//   越靠近本方球门(d大) → 丢球后果重 → 不敢带
+// dribbleTendency: 战术预留（默认0，将来可正可负）
+function dribbleUtility(v, pressure, xgValue, dribbleTendency = 0) {
+  const distMap = { BOX_A: 8, DEEP_A: 14, MID_A: 22, MID_D: 35, DEEP_D: 45, BOX_D: 55 };
+  const d = distMap[v] || 25;
+
+  // riskFactor: 连续物理量 — 离球门越远，丢球风险成本越高
+  // d=8m(BOX_A)→0.85, d=35m(MID_D)→0.36, d=55m(BOX_D)→0.00(自然归零)
+  const riskFactor = Math.max(0, 1 - d / 55);
+
   const xgBlock = Math.max(0, 1 - xgValue / 0.20);
   const pressBlock = 1 - pressure;
-  const zoneBase = (v === 'MID_D') ? 0.06 : (v === 'MID_A') ? 0.05 : (v === 'DEEP_A') ? 0.04 : 0.03;
-  return zoneBase * xgBlock * pressBlock;
+
+  // baseWillingness: 行为校准常数（单一标量，非zone分档魔数）
+  const baseWillingness = 0.12;
+
+  return baseWillingness * riskFactor * xgBlock * pressBlock * Math.exp(dribbleTendency);
 }
 
 // ── xG 快速估算 ──
@@ -955,7 +982,8 @@ function dribbleUtility(v, pressure, xgValue) {
 function estimateXG(v, ctx) {
   if (v === 'BOX_D' || v === 'DEEP_D') return 0;
   const d = ctx.distance || 25;
-  const angle = ctx.angle || 45;
+  // 注意：angle=0 是合法值（边线窄角度），不能用 || 短路
+  const angle = (ctx.angle != null) ? ctx.angle : 45;
   const pressure = ctx.pressure || 0;
   const aRad = angle * Math.PI / 180;
   const z = 0.2 - d * 0.16 + aRad * 0.7 - pressure * 1.0;
@@ -963,12 +991,29 @@ function estimateXG(v, ctx) {
 }
 
 // ── 综合决策 ──
-function decisionProbs(ballZone, role, attrs, pressure, tacticPos, xgValue) {
+// shootWillingness: 战术预留（默认0，将来可正可负）
+// passTendency:      战术预留（默认0，将来可正可负）
+// dribbleTendency:   战术预留（默认0，将来可正可负）
+// matchMinute: 比赛分钟数（用于时间压力计算）
+// attrs: 球员属性 { 自信, 团队, ... }
+function decisionProbs(ballZone, role, attrs, pressure, tacticPos, xgValue, shootWillingness = 0, matchMinute = 0, passTendency = 0, dribbleTendency = 0) {
   const v = getZoneV(ballZone);
   const xg = xgValue !== undefined ? xgValue : 0.1;
-  const shootU  = shootUtility(xg);
-  const passU   = passUtility(v, pressure);
-  const dribbleU = dribbleUtility(v, pressure, xg);
+
+  // ── 个人因素加权 ──
+  // shootWillingness: 战术预留（将来由战术系统/个性系统填入）
+  // timePressure: 最后10分钟+ 迫近射门倾向
+  const timePressureBonus = (matchMinute >= 80) ? Math.min(0.3, (matchMinute - 80) / 10 * 0.3) : 0;
+  // 球员个性：自信↑ → 更敢射；团队↓ → 更爱单干
+  const confidence = (attrs['自信'] != null) ? attrs['自信'] : 10;
+  const teamwork = (attrs['团队'] != null) ? attrs['团队'] : 10;
+  const personalityBonus = (confidence - 10) * 0.04 + (10 - teamwork) * 0.04;
+
+  const personalModifier = shootWillingness + timePressureBonus + personalityBonus;
+
+  const shootU  = shootUtility(xg, personalModifier);
+  const passU   = passUtility(v, pressure, passTendency);
+  const dribbleU = dribbleUtility(v, pressure, xg, dribbleTendency);
 
   const total = shootU + passU + dribbleU;
   return {
@@ -1070,9 +1115,11 @@ function determineSituation(rng, ballZone, carrierRole, carrierAttrs, possession
     // 禁区持球：决策
     if (/^(ST_|W_|IF_|AM_)/.test(carrierRole)) {
       const xg = estimateXG(v, ctx);
-      const { pShoot, pPass, pDribble } = decisionProbs(ballZone, carrierRole, carrierAttrs, ctx.pressure, undefined, xg);
+      const { pShoot, pPass, pDribble } = decisionProbs(ballZone, carrierRole, carrierAttrs, ctx.pressure, undefined, xg, 0, matchContext.match_minute || 0, 0, 0);
       const r = rng.random();
-      if (r < pShoot) return { type: 'shoot', subType: 'boxShot', context: ctx };
+      if (r < pShoot) {
+        return { type: 'shoot', subType: 'boxShot', context: ctx };
+      }
       if (r < pShoot + pPass) return { type: 'pass', subType: 'boxPass', context: ctx };
       return { type: 'dribble', subType: 'boxDribble', context: ctx };
     }
@@ -1103,9 +1150,11 @@ function determineSituation(rng, ballZone, carrierRole, carrierAttrs, possession
     }
     if (/^(ST_|W_|IF_|AM_)/.test(carrierRole)) {
       const xg = estimateXG(v, ctx);
-      const { pShoot, pPass, pDribble } = decisionProbs(ballZone, carrierRole, carrierAttrs, ctx.pressure, undefined, xg);
+      const { pShoot, pPass, pDribble } = decisionProbs(ballZone, carrierRole, carrierAttrs, ctx.pressure, undefined, xg, 0, matchContext.match_minute || 0, 0, 0);
       const r = rng.random();
-      if (r < pShoot) return { type: 'shoot', subType: 'attackShot', context: ctx };
+      if (r < pShoot) {
+        return { type: 'shoot', subType: 'attackShot', context: ctx };
+      }
       if (r < pShoot + pPass) return { type: 'pass', subType: 'finalThirdPass', context: ctx };
       return { type: 'dribble', subType: 'finalThirdDribble', context: ctx };
     }
@@ -1127,7 +1176,7 @@ function determineSituation(rng, ballZone, carrierRole, carrierAttrs, possession
         return { type: 'tackle', subType: 'counterPress', context: ctx };
       }
       const xg = estimateXG(v, ctx);
-      const { pPass, pDribble } = decisionProbs(ballZone, carrierRole, carrierAttrs, ctx.pressure, undefined, xg);
+      const { pPass, pDribble } = decisionProbs(ballZone, carrierRole, carrierAttrs, ctx.pressure, undefined, xg, 0, matchContext.match_minute || 0, 0, 0);
       if (rng.random() < pDribble / (pDribble + pPass)) {
         return { type: 'dribble', subType: 'counter', context: ctx };
       }
@@ -1137,9 +1186,11 @@ function determineSituation(rng, ballZone, carrierRole, carrierAttrs, possession
     // 进攻球员在中场前区：决策
     if (/^(ST_|W_|IF_|AM_)/.test(carrierRole)) {
       const xg = estimateXG(v, ctx);
-      const { pShoot, pPass, pDribble } = decisionProbs(ballZone, carrierRole, carrierAttrs, ctx.pressure, undefined, xg);
+      const { pShoot, pPass, pDribble } = decisionProbs(ballZone, carrierRole, carrierAttrs, ctx.pressure, undefined, xg, 0, matchContext.match_minute || 0, 0, 0);
       const r = rng.random();
-      if (r < pShoot) return { type: 'shoot', subType: 'longShot', context: ctx };
+      if (r < pShoot) {
+        return { type: 'shoot', subType: 'longShot', context: ctx };
+      }
       if (r < pShoot + pPass) return { type: 'pass', subType: 'attackPass', context: ctx };
       return { type: 'dribble', subType: 'attackDribble', context: ctx };
     }
@@ -1147,12 +1198,14 @@ function determineSituation(rng, ballZone, carrierRole, carrierAttrs, possession
     // 中场控制：决策 + 争顶
     {
       const xg = estimateXG(v, ctx);
-      const { pShoot, pPass, pDribble } = decisionProbs(ballZone, carrierRole, carrierAttrs, ctx.pressure, undefined, xg);
+      const { pShoot, pPass, pDribble } = decisionProbs(ballZone, carrierRole, carrierAttrs, ctx.pressure, undefined, xg, 0, matchContext.match_minute || 0, 0, 0);
       if (contestCheck()) {
         return { type: 'contest', subType: 'midfieldContest', context: { ...ctx, intent: 'possession' } };
       }
       const r = rng.random();
-      if (r < pShoot) return { type: 'shoot', subType: 'longShot', context: ctx };
+      if (r < pShoot) {
+        return { type: 'shoot', subType: 'longShot', context: ctx };
+      }
       if (r < pShoot + pPass) return { type: 'pass', subType: 'midfieldPass', context: ctx };
       return { type: 'dribble', subType: 'midfieldCarry', context: ctx };
     }
@@ -1530,11 +1583,13 @@ class MatchEngine {
   // 22人移动系统
   // ============================================================
 
-  /** 初始化所有22名球员的真实坐标(从zone推导) */
+  /** 初始化所有22名球员的真实坐标(从zone推导)
+   * 共享坐标系: x ∈ [-52.5, 52.5], 负=主队球门方向, 正=客队球门方向
+   * 主队攻击方向: +x, 客队攻击方向: -x
+   */
   _initPlayerCoords() {
     this._playerCoords = {};
-
-    // 主场: zone → 坐标
+    // 主场: 直接使用zone坐标 (主队攻击+x方向)
     for (const [pid, p] of Object.entries(this.home.players)) {
       const zone = getPlayerZone(p.role, this.home.tactics);
       const { x, y } = zoneToCoord(zone);
@@ -1546,13 +1601,18 @@ class MatchEngine {
       };
     }
 
-    // 客场: mirrored zone → 坐标, 然后翻转x(客场攻击方向相反)
+    // 客场: zone是"从客队视角"定义的，需要mirror到共享坐标系
+    // 客队攻击-x方向，所以他们的DEEP_D(后场)对应共享坐标系的DEEP_A(+x方向)
     for (const [pid, p] of Object.entries(this.away.players)) {
       const rawZone = getPlayerZone(p.role, this.away.tactics);
+      // mirror: 客队的后场(DEEP_D) → 共享坐标系的DEEP_A(+x侧)
       const zone = mz(rawZone);
       const { x, y } = zoneToCoord(zone);
+      // 重要：mirrorZone翻转了左右(L↔R)，导致客队的FB_L站在了右边
+      // 但FB_L应该始终站在左边(从该队视角)，所以我们需要翻转y坐标
+      // 这样客队的FB_L(y=-23.8)和主队的FB_L(y=-23.8)都在同一边(左边)
       this._playerCoords[pid] = {
-        x: -x, y: y, defaultX: -x, defaultY: y,
+        x, y: -y, defaultX: x, defaultY: -y,
         role: p.role, attrs: p.attrs,
         fatigue: 0, distanceCovered: 0,
         team: 'away'
@@ -1617,11 +1677,16 @@ class MatchEngine {
       allPlayers
     };
 
-    // 执行移动
-    const updated = updatePlayerPositions(allPlayers, ctx, dt);
+    // 执行移动 - 将大时间步分成多个小时间步，使球员持续向目标移动
+    const SUB_STEPS = 5;  // 每个事件分成5个小时间步
+    const subDT = dt / SUB_STEPS;
+    let currentPlayers = allPlayers;
+    for (let i = 0; i < SUB_STEPS; i++) {
+      currentPlayers = updatePlayerPositions(currentPlayers, ctx, subDT);
+    }
 
     // 回写坐标
-    for (const p of updated) {
+    for (const p of currentPlayers) {
       if (this._playerCoords[p.id]) {
         this._playerCoords[p.id].x = p.x;
         this._playerCoords[p.id].y = p.y;
@@ -1631,7 +1696,7 @@ class MatchEngine {
     }
 
     // 同步疲劳度到球员对象
-    for (const p of updated) {
+    for (const p of currentPlayers) {
       const team = p.team === 'home' ? this.home : this.away;
       const po = team.players[p.id];
       if (po) po.fatigue = p.fatigue || 0;
@@ -1643,7 +1708,7 @@ class MatchEngine {
       const snapshot = {
         tick: this._tickCount,
         minute: this.minute,
-        players: updated.map(p => ({
+        players: currentPlayers.map(p => ({
           id: p.id, role: p.role, team: p.team,
           x: p.x.toFixed(1), y: p.y.toFixed(1),
           fatigue: (p.fatigue * 100).toFixed(0) + '%'
@@ -1702,62 +1767,73 @@ class MatchEngine {
 
   _generateEventDescription(situation, actionType, result, playerName, zoneName) {
     const { type, subType } = situation;
+    const timeStr = this.minute !== undefined ? `${this.minute}'` : '0\'';
+    const ballZone = this.ball_zone || '未知区域';
+    
+    // 构建决策详情
+    let decisionDetail = '';
+    if (result.intent) {
+      if (result.intent.targetZone) decisionDetail += `→目标:${result.intent.targetZone} `;
+      if (result.intent.anticipation) decisionDetail += `预判:${result.intent.anticipation} `;
+    }
+    if (result.successProb !== undefined) decisionDetail += `成功率:${(result.successProb * 100).toFixed(0)}% `;
+    if (result.winProb !== undefined) decisionDetail += `胜率:${(result.winProb * 100).toFixed(0)}% `;
 
     switch (type) {
       case 'pass':
         if (result.successProb > 0.7) {
-          return `[${this.minute}'] ${playerName}在${zoneName}完成精准传球`;
+          return `[${timeStr}] ${playerName}在${zoneName}精准传球 ${decisionDetail}|球→${ballZone}`;
         } else if (result.successProb > 0.4) {
-          return `[${this.minute}'] ${playerName}在${zoneName}尝试传球${result.interceptProb > 0.3 ? '被拦截!' : ''}`;
+          return `[${timeStr}] ${playerName}在${zoneName}传球${result.interceptProb > 0.3 ? '被拦截!' : '成功'} ${decisionDetail}|球→${ballZone}`;
         } else {
-          return `[${this.minute}'] ${playerName}在${zoneName}传球失误`;
+          return `[${timeStr}] ${playerName}在${zoneName}传球失误 ${decisionDetail}|球→${ballZone}`;
         }
 
       case 'dribble':
         if (result.successRate > 0.7) {
-          return `[${this.minute}'] ${playerName}在${zoneName}成功盘带突破`;
+          return `[${timeStr}] ${playerName}在${zoneName}盘带突破 ${decisionDetail}|球→${ballZone}`;
         } else if (result.successRate > 0.4) {
-          return `[${this.minute}'] ${playerName}在${zoneName}尝试盘带${result.intent?.feint?.isDeceived ? '假动作骗过防守!' : ''}`;
+          return `[${timeStr}] ${playerName}在${zoneName}盘带${result.intent?.feint?.isDeceived ? '假动作!' : ''} ${decisionDetail}|球→${ballZone}`;
         } else {
-          return `[${this.minute}'] ${playerName}在${zoneName}盘带被断`;
+          return `[${timeStr}] ${playerName}在${zoneName}盘带被断 ${decisionDetail}|球→${ballZone}`;
         }
 
       case 'shoot':
         this.stats[this.possession === "home" ? "home" : "away"].shots += 1;
         if (result.totalProb > 0.3) {
           this.stats[this.possession === "home" ? "home" : "away"].shots_on_target += 1;
-          return `[${this.minute}'] ${playerName}在${zoneName}射门! 球进了! ⚽`;
+          return `[${timeStr}] ${playerName}在${zoneName}射门⚽进球! ${decisionDetail}|球→${ballZone}`;
         } else if (result.onTargetRate > 0.5) {
           this.stats[this.possession === "home" ? "home" : "away"].shots_on_target += 1;
-          return `[${this.minute}'] ${playerName}在${zoneName}射门! 被门将扑出!`;
+          return `[${timeStr}] ${playerName}在${zoneName}射门被扑 ${decisionDetail}|球→${ballZone}`;
         } else {
-          return `[${this.minute}'] ${playerName}在${zoneName}射门打偏`;
+          return `[${timeStr}] ${playerName}在${zoneName}射门打偏 ${decisionDetail}|球→${ballZone}`;
         }
 
       case 'tackle':
         if (result.winProb > 0.6) {
           this.stats[this.possession === "home" ? "home" : "away"].tackles += 1;
-          return `[${this.minute}'] ${playerName}成功抢断!${result.anticipation?.isCorrect ? '预判准确!' : ''}`;
+          return `[${timeStr}] ${playerName}抢断成功${result.anticipation?.isCorrect ? '(预判)' : ''} ${decisionDetail}|球→${ballZone}`;
         } else if (result.foulProb > 0.3) {
           this.stats[this.possession === "home" ? "home" : "away"].fouls += 1;
-          return `[${this.minute}'] ${playerName}抢断犯规!`;
+          return `[${timeStr}] ${playerName}抢断犯规 ${decisionDetail}|球→${ballZone}`;
         } else {
-          return `[${this.minute}'] ${playerName}抢断失败`;
+          return `[${timeStr}] ${playerName}抢断失败 ${decisionDetail}|球→${ballZone}`;
         }
 
       case 'contest':
         if (result.winProb > 0.6) {
-          return `[${this.minute}'] ${playerName}争顶成功!`;
+          return `[${timeStr}] ${playerName}争顶成功 ${decisionDetail}|球→${ballZone}`;
         } else {
-          return `[${this.minute}'] ${playerName}争顶失败`;
+          return `[${timeStr}] ${playerName}争顶失败 ${decisionDetail}|球→${ballZone}`;
         }
 
       case 'save':
         this.stats[this.possession === "home" ? "away" : "home"].saves += 1;
         if (result.saveProb > 0.5) {
-          return `[${this.minute}'] 门将精彩扑救!${result.anticipation?.isCorrect ? '预判准确!' : ''}`;
+          return `[${timeStr}] 门将扑救成功${result.anticipation?.isCorrect ? '(预判)' : ''} ${decisionDetail}|球→${ballZone}`;
         } else {
-          return `[${this.minute}'] 门将扑救失败`;
+          return `[${timeStr}] 门将扑救失败 ${decisionDetail}|球→${ballZone}`;
         }
 
       default:
@@ -1978,6 +2054,7 @@ class MatchEngine {
       setPiece: this.set_piece,
       realDefDist: realDefDist,
       realPressure: Math.max(0, Math.min(1, 1 - (realDefDist - 0.3) / 4.7)),
+      match_minute: this.minute,
     };
 
     // 1. 情境判断（传入持球者属性，让球员自己做决策）
@@ -2012,9 +2089,14 @@ class MatchEngine {
     this._syncBallCoord();
 
     // 8. 22人移动更新（在时间推进前，使用本次动作耗时）
+    // 注意：timeCost是动作执行时间，但球员在此期间和之后都在移动
     const timeCost = { pass: [8, 15], dribble: [10, 18], shoot: [5, 12], tackle: [8, 15], contest: [10, 18], save: [3, 8] };
     const [tmin, tmax] = timeCost[situation.type] || [10, 15];
-    const stepDT = (tmin + tmax) / 2;  // 平均秒数
+    const actionTime = (tmin + tmax) / 2;  // 平均秒数
+    
+    // 使用固定的合理时间步长，确保球员移动平滑且符合物理
+    // 目标：每次事件球员移动5-15米（现实足球中10-15秒内的移动距离）
+    const stepDT = Math.min(actionTime * 2, 30);  // 最大30秒，避免过大移动
     this._stepMovementPlayers(stepDT);
 
     // 9. 时间推进
@@ -2030,6 +2112,20 @@ class MatchEngine {
     this.is_scramble = false;
     this.set_piece = null;
 
+    // Get carrier's real coordinates for frontend visualization
+    const carrierCoord = this._playerCoords[this.ball_carrier] || null;
+
+    // Build positions snapshot for all 22 players (for frontend 2D visualization)
+    const positions = {};
+    for (const [pid, coord] of Object.entries(this._playerCoords)) {
+      const side = coord.team; // 'home' or 'away'
+      positions[`${side}_${pid}`] = {
+        x: coord.x,
+        y: coord.y,
+        role: coord.role
+      };
+    }
+
     const event = {
       type: situation.type,
       subType: situation.subType,
@@ -2041,6 +2137,9 @@ class MatchEngine {
       zone: this.ball_zone,
       carrier_pid: this.ball_carrier,
       carrier_side: this.possession,
+      carrier_x: carrierCoord ? carrierCoord.x : undefined,
+      carrier_y: carrierCoord ? carrierCoord.y : undefined,
+      positions, // All 22 players' positions for 2D visualization
       result: {
         successProb: result.successProb || result.successRate || result.winProb || result.saveProb,
         intent: result.intent || result.anticipation || null

@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>2D Visualization Test</title>
+  <style>
+    body { background: #0b1220; color: #fff; font-family: sans-serif; padding: 20px; }
+    #pitch { width: 300px; height: 475px; background: #14572a; position: relative; border: 2px solid #fff; }
+    .player { position: absolute; width: 12px; height: 12px; border-radius: 50%; transform: translate(-50%, -50%); font-size: 8px; text-align: center; line-height: 12px; }
+    .home { background: #ef4444; }
+    .away { background: #3b82f6; }
+    .ball { position: absolute; width: 8px; height: 8px; background: #fbbf24; border-radius: 50%; transform: translate(-50%, -50%); }
+    #info { margin-top: 20px; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h2>2D Visualization Test</h2>
+  <div id="pitch"></div>
+  <div id="info"></div>
+  <button onclick="nextEvent()">Next Event</button>
+  
+  <script>
+    // Mock data for testing
+    const events = [
+      {
+        time: 1,
+        team: 'home',
+        carrier_pid: 'home_P4',
+        carrier_x: -23.1,
+        carrier_y: 29.8,
+        zone: 'DEEP_D_R',
+        positions: {
+          'home_home_P0': { x: -51.5, y: 0, role: 'GK' },
+          'home_home_P1': { x: -27.6, y: -23.8, role: 'FB_L' },
+          'home_home_P2': { x: -27.6, y: -11.2, role: 'CB_L' },
+          'home_home_P3': { x: -27.6, y: 11.2, role: 'CB_R' },
+          'home_home_P4': { x: -23.1, y: 29.8, role: 'FB_R' },  // Carrier
+          'home_home_P5': { x: -9.2, y: -11.2, role: 'CM_L' },
+          'home_home_P6': { x: -9.2, y: 0, role: 'CM_C' },
+          'home_home_P7': { x: -9.2, y: 11.2, role: 'CM_R' },
+          'home_home_P8': { x: 9.2, y: -23.8, role: 'W_L' },
+          'home_home_P9': { x: 27.6, y: 0, role: 'ST_C' },
+          'home_home_P10': { x: 9.2, y: 23.8, role: 'W_R' },
+        }
+      },
+      {
+        time: 2,
+        team: 'home',
+        carrier_pid: 'home_P6',
+        carrier_x: -5.2,
+        carrier_y: 0,
+        zone: 'MID_D_C',
+        positions: {
+          'home_home_P0': { x: -51.5, y: 0, role: 'GK' },
+          'home_home_P1': { x: -25.0, y: -22.0, role: 'FB_L' },
+          'home_home_P2': { x: -25.0, y: -10.0, role: 'CB_L' },
+          'home_home_P3': { x: -25.0, y: 10.0, role: 'CB_R' },
+          'home_home_P4': { x: -20.0, y: 25.0, role: 'FB_R' },
+          'home_home_P5': { x: -8.0, y: -10.0, role: 'CM_L' },
+          'home_home_P6': { x: -5.2, y: 0, role: 'CM_C' },  // Carrier
+          'home_home_P7': { x: -8.0, y: 10.0, role: 'CM_R' },
+          'home_home_P8': { x: 10.0, y: -20.0, role: 'W_L' },
+          'home_home_P9': { x: 25.0, y: 0, role: 'ST_C' },
+          'home_home_P10': { x: 10.0, y: 20.0, role: 'W_R' },
+        }
+      }
+    ];
+    
+    let currentEvent = 0;
+    
+    function realCoordToSVG(x, y) {
+      const W = 300, H = 475;
+      const xPct = (x + 52.5) / 105 * 100;
+      const yPct = (y + 34) / 68 * 100;
+      return [
+        (xPct / 100) * W,
+        H - (yPct / 100) * H
+      ];
+    }
+    
+    function renderEvent(ev) {
+      const pitch = document.getElementById('pitch');
+      pitch.innerHTML = '';
+      
+      // Render players
+      for (const [key, pos] of Object.entries(ev.positions)) {
+        const [svgX, svgY] = realCoordToSVG(pos.x, pos.y);
+        const div = document.createElement('div');
+        div.className = 'player home';
+        div.style.left = svgX + 'px';
+        div.style.top = svgY + 'px';
+        div.textContent = pos.role.slice(0, 2);
+        pitch.appendChild(div);
+      }
+      
+      // Render ball at carrier position
+      const [ballX, ballY] = realCoordToSVG(ev.carrier_x, ev.carrier_y);
+      const ball = document.createElement('div');
+      ball.className = 'ball';
+      ball.style.left = ballX + 'px';
+      ball.style.top = ballY + 'px';
+      pitch.appendChild(ball);
+      
+      // Info
+      document.getElementById('info').innerHTML = `
+        Time: ${ev.time}'<br>
+        Carrier: ${ev.carrier_pid}<br>
+        Carrier Pos: x=${ev.carrier_x.toFixed(1)}, y=${ev.carrier_y.toFixed(1)}<br>
+        Ball Pos: x=${ballX.toFixed(1)}, y=${ballY.toFixed(1)} (SVG)
+      `;
+    }
+    
+    function nextEvent() {
+      renderEvent(events[currentEvent]);
+      currentEvent = (currentEvent + 1) % events.length;
+    }
+    
+    // Render first event
+    nextEvent();
+  </script>
+</body>
+</html>

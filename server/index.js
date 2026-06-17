@@ -195,8 +195,7 @@ async function handle(req, res) {
           events: [], summary: null,
         });
       }
-      const events = (engine.events || [])
-        .filter(ev => ev && ev.desc)
+      const events = (summary.events || [])
         .map(ev => ({
           sid: ev.sid || null, aid: ev.aid || null,
           time: ev.minute, text: ev.desc, team: ev.team || null,
@@ -205,6 +204,8 @@ async function handle(req, res) {
           zone: (ev.carrier_side === 'away' && ev.zone) ? mirrorZone(ev.zone) : (ev.zone || null),
           carrier_pid: ev.carrier_pid || null,
           carrier_side: ev.carrier_side || null,
+          carrier_x: ev.carrier_x,
+          carrier_y: ev.carrier_y,
           positions: ev.positions || null,
         }));
       summary.events = events;
